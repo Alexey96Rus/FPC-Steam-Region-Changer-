@@ -1,0 +1,7164 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import random
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+_REQUIRED_PACKAGES = [
+    ("aiohttp", "aiohttp"),
+    ("aiohttp_socks", "aiohttp_socks"),
+    ("requests", "requests"),
+    ("pysteamauth", "pysteamauth"),
+    ("colorama", "colorama"),
+    ("qrcode", "qrcode"),
+    ("PIL", "pillow"),
+]
+_missing_pkgs = []
+for _mod, _pkg in _REQUIRED_PACKAGES:
+    try:
+        __import__(_mod)
+    except ImportError:
+        _missing_pkgs.append(_pkg)
+
+if _missing_pkgs:
+    print(f"[Steam Region Changer] Установка отсутствующих библиотек: {', '.join(_missing_pkgs)}...")
+    _installed = False
+    for _extra_args in [["--break-system-packages"], []]:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", *_missing_pkgs, "--quiet", "--no-warn-script-location", *_extra_args],
+                timeout=180,
+            )
+            print("[Steam Region Changer] Библиотеки успешно установлены.")
+            _installed = True
+            break
+        except Exception:
+            continue
+    if not _installed:
+        print(f"[Steam Region Changer] Ошибка авто-установки. Установите вручную: pip install {' '.join(_missing_pkgs)}")
+
+import requests
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable, Mapping, Optional
+
+import aiohttp
+from aiohttp import ClientResponse, ClientSession, FormData
+
+import html
+try:
+    from colorama import Fore, Style
+except ImportError:
+    class _DummyColor:
+        def __getattr__(self, name):
+            return ""
+    Fore = _DummyColor()
+    Style = _DummyColor()
+logger = logging.getLogger("FPC.SteamRegionChanger")
+LP = "[Steam Region Changer]"
+
+BASE_DIR = os.getcwd()
+STORAGE_DIR = os.path.join(BASE_DIR, "storage", "plugins", "src_plugin")
+PLUGIN_LOG_DIR = STORAGE_DIR
+PLUGIN_LOG_FILE = os.path.join(PLUGIN_LOG_DIR, "src_plugin.log")
+_ANSI_STRIP_RE = re.compile(r"(\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]))")
+
+class _CleanFileFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        s = super().format(record)
+        return _ANSI_STRIP_RE.sub("", s)
+try:
+    os.makedirs(PLUGIN_LOG_DIR, exist_ok=True)
+    if os.path.exists(PLUGIN_LOG_FILE) and os.path.getsize(PLUGIN_LOG_FILE) < 15 * 1024 * 1024:
+        try:
+            with open(PLUGIN_LOG_FILE, "r", encoding="utf-8", errors="ignore") as _f_clean:
+                _content = _f_clean.read()
+            if "\x1b" in _content:
+                with open(PLUGIN_LOG_FILE, "w", encoding="utf-8") as _f_clean:
+                    _f_clean.write(_ANSI_STRIP_RE.sub("", _content))
+        except Exception:
+            pass
+    _fh = logging.FileHandler(PLUGIN_LOG_FILE, encoding="utf-8")
+    _fh.setFormatter(_CleanFileFormatter("[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"))
+    logger.addHandler(_fh)
+except Exception:
+    pass
+def _mask_gift_code(c: str) -> str:
+    s = (c or "").strip()
+    if len(s) <= 6:
+        return "***"
+    return f"{s[:4]}-****-{s[-4:]}"
+def _mask_proxy(p: str) -> str:
+    s = str(p or "")
+    s = re.sub(r':([^@:]+)@', ':***@', s)
+    if "://" in s:
+        return s
+    parts = s.split(":")
+    if len(parts) == 4 and not parts[0].lower().startswith(("http", "socks")):
+        if parts[1].isdigit():
+            return f"{parts[0]}:{parts[1]}:{parts[2]}:***"
+        elif parts[3].isdigit():
+            return f"{parts[0]}:***:{parts[2]}:{parts[3]}"
+    return s
+def _log_event(event: str, level: int = logging.INFO, **fields: Any) -> None:
+    tag = f"{Fore.CYAN}{LP}{Style.RESET_ALL}"
+    ev_str = f"{Fore.YELLOW}event={event}{Style.RESET_ALL}"
+    parts = [tag, ev_str]
+    for k, v in fields.items():
+        if v is None:
+            continue
+        v_str = str(v).replace('\r', ' ').replace('\n', ' ')
+        if any(token in k.lower() for token in ('password', 'secret', 'token', 'code')):
+            v_str = '***'
+        elif k in ('proxy', 'proxy_url'):
+            v_str = _mask_proxy(v_str)
+        if k in ('status', 'result'):
+            if str(v).lower() in ('ok', 'success', 'alive', '200', 'fixed'):
+                val_colored = f"{Fore.GREEN}{v_str}{Style.RESET_ALL}"
+            else:
+                val_colored = f"{Fore.RED}{v_str}{Style.RESET_ALL}"
+        elif any(w in k.lower() for w in ('err', 'fail', 'reason', 'error')):
+            val_colored = f"{Fore.RED}{v_str}{Style.RESET_ALL}"
+        elif k in ('ms', 'latency', 'latency_ms', 'ping'):
+            val_colored = f"{Fore.MAGENTA}{v_str}{Style.RESET_ALL}"
+        else:
+            val_colored = f"{Fore.WHITE}{v_str}{Style.RESET_ALL}"
+        parts.append(f"{Fore.LIGHTBLUE_EX}{k}={Style.RESET_ALL}{val_colored}")
+    logger.log(level, " ".join(parts))
+try:
+    from tg_bot import CBT as _CBT
+except Exception:
+    _CBT = None
+try:
+    from telebot import types as tg_types
+except Exception:
+    tg_types = None
+NAME = "Steam Region Changer"
+VERSION = "1.0.10.1"
+DESCRIPTION = "Смена региона Steam (Steam Region Changer)"
+CREDITS = "@tinechelovec"
+UUID = "001ab503-775a-41c2-8b96-4207daaf33a7"
+SETTINGS_PAGE = True
+
+_CBT_PLUGIN_SETTINGS = getattr(_CBT, 'PLUGIN_SETTINGS', None) if _CBT else None
+CBT_SETTINGS = f"{_CBT_PLUGIN_SETTINGS}:{UUID}:0" if _CBT_PLUGIN_SETTINGS is not None else ""
+CB_PLUGINS_LIST_OPEN = f"{getattr(_CBT, 'PLUGINS_LIST', '44')}:0" if _CBT else "44:0"
+
+CREATOR_URL = "https://t.me/tinechelovec/"
+GROUP_URL = "https://t.me/dev_thc_chat"
+CHANNEL_URL = "https://t.me/by_thc"
+GITHUB_URL = "https://github.com/tinechelovec/FPC-Steam-Region-Changer"
+GITHUB_UPDATE_URL = os.getenv("SRC_PLUGIN_UPDATE_URL", "https://raw.githubusercontent.com/tinechelovec/FPC-Steam-Region-Changer/main/SRC-Plugin.py").strip()
+INSTRUCTION_URL = "https://teletype.in/@tinechelovec/nar8B0PvCQg"
+ALT_INSTRUCTION_URL = "https://github.com/tinechelovec/FPC-Steam-Region-Changer/blob/main/instructions.md"
+
+REGION_REQUEST_TIMEOUT = float(os.getenv("REGION_REQUEST_TIMEOUT", "30"))
+REGION_CONNECT_TIMEOUT = float(os.getenv("REGION_CONNECT_TIMEOUT", "15"))
+
+REGION_WAIT_INTERVAL = 1.5
+REGION_WAIT_TRIES = 3
+
+REGION_MAX_WORKERS = 10
+
+GuardProvider = Callable[[str], Awaitable[str]]
+
+QRDisplay = Callable[[str], Awaitable[None]]
+
+URL_SET_COUNTRY = "https://store.steampowered.com/country/setcountry"
+URL_SET_COUNTRY_CHK = "https://checkout.steampowered.com/country/setcountry"
+URL_REDEEM = "https://store.steampowered.com/account/ajaxredeemwalletcode/"
+URL_ADDFUNDS = "https://store.steampowered.com/steamaccount/addfunds"
+URL_STORE = "https://store.steampowered.com/"
+URL_REDEEM_GIFT = "https://store.steampowered.com/account/ajaxredeemwalletcode/"
+URL_ACCOUNT_HISTORY = "https://store.steampowered.com/account/history/"
+URL_ACCOUNT_LICENSES = "https://store.steampowered.com/account/licenses/"
+URL_ACCOUNT = "https://store.steampowered.com/account/"
+
+RATE_LIMIT_DELAY = 30
+
+MAX_PROXY_ATTEMPTS_FLOOR = 10
+REGION_ATTEMPTS_PER_PROXY = max(1, int(os.getenv("SRC_ATTEMPTS_PER_PROXY", "2")))
+REGION_MAX_TOTAL_ATTEMPTS = max(2, int(os.getenv("SRC_MAX_TOTAL_ATTEMPTS", "6")))
+
+GIFT_MAX_PROXY_ATTEMPTS = 3
+
+_RETRYABLE_HTTP = {503, 502, 504, 429, 520, 521, 522, 523, 524}
+
+_EVENT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(os.getenv("SRC_EVENT_WORKERS", "3"))),
+    thread_name_prefix="SRC-EVENT",
+)
+_ORDER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(os.getenv("SRC_ORDER_WORKERS", "4"))),
+    thread_name_prefix="SRC-ORDER",
+)
+_EVENT_JOBS: dict[str, Any] = {}
+_ORDER_JOBS: dict[str, Any] = {}
+_EVENT_JOBS_LOCK = threading.Lock()
+_ORDER_JOBS_LOCK = threading.Lock()
+_CHAT_EVENT_LOCKS: dict[str, threading.RLock] = {}
+_CHAT_EVENT_LOCKS_LOCK = threading.Lock()
+_QR_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_QR_CANCEL_EVENTS_LOCK = threading.Lock()
+
+def _get_or_create_qr_cancel_event(order_id: str) -> threading.Event:
+    oid = str(order_id).strip().lstrip("#")
+    with _QR_CANCEL_EVENTS_LOCK:
+        evt = _QR_CANCEL_EVENTS.get(oid)
+        if evt is None or evt.is_set():
+            evt = threading.Event()
+            _QR_CANCEL_EVENTS[oid] = evt
+        return evt
+
+def _cancel_qr_worker(order_id: str, reason: str = "") -> None:
+    oid = str(order_id).strip().lstrip("#")
+    if not oid:
+        return
+    with _QR_CANCEL_EVENTS_LOCK:
+        evt = _QR_CANCEL_EVENTS.get(oid)
+        if evt is not None and not evt.is_set():
+            _log_event("qr_worker_cancel_requested", order_id=oid, reason=reason)
+            evt.set()
+    try:
+        sess_lock = globals().get("_sessions_lock")
+        buyer_sess = globals().get("_buyer_sessions")
+        act_sess = globals().get("_active_sessions")
+        if sess_lock is not None:
+            with sess_lock:
+                if isinstance(buyer_sess, dict):
+                    for s in buyer_sess.values():
+                        if str(s.get("order_id") or "").strip().lstrip("#") == oid:
+                            c_evt = s.get("cancel_qr_event")
+                            if c_evt and isinstance(c_evt, threading.Event) and not c_evt.is_set():
+                                c_evt.set()
+                if isinstance(act_sess, list):
+                    for s in act_sess:
+                        if str(s.get("order_id") or "").strip().lstrip("#") == oid:
+                            c_evt = s.get("cancel_qr_event")
+                            if c_evt and isinstance(c_evt, threading.Event) and not c_evt.is_set():
+                                c_evt.set()
+    except Exception:
+        pass
+
+def _get_chat_event_lock(key: str) -> threading.RLock:
+    key = str(key or "global")
+    with _CHAT_EVENT_LOCKS_LOCK:
+        lock = _CHAT_EVENT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _CHAT_EVENT_LOCKS[key] = lock
+        return lock
+
+def _run_serialized_event(serial_key: str, fn, *args, **kwargs):
+    lock = _get_chat_event_lock(serial_key)
+    with lock:
+        return fn(*args, **kwargs)
+
+def _event_chat_key(event, order=None) -> str:
+    chat_obj = getattr(event, "chat", None)
+    for obj in (order, getattr(event, "order", None), getattr(event, "message", None), chat_obj, event):
+        if obj is None:
+            continue
+        cid = getattr(obj, "chat_id", None)
+        if cid is None and obj is chat_obj:
+            cid = getattr(obj, "id", None)
+        if cid is not None and str(cid).strip():
+            return f"chat:{cid}"
+    return "global"
+
+def _message_event_identity(event) -> str:
+    msg = getattr(event, "message", None)
+    chat = getattr(event, "chat", None)
+    mid = getattr(msg, "id", None) or getattr(chat, "node_msg_id", None) or getattr(chat, "user_msg_id", None)
+    if mid is not None:
+        return str(mid)
+    txt = str(
+        getattr(msg, "text", "")
+        or getattr(msg, "content", "")
+        or getattr(chat, "last_message_text", "")
+        or getattr(event, "text", "")
+        or getattr(event, "last_message_text", "")
+        or getattr(event, "content", "")
+        or ""
+    )
+    return str(abs(hash(txt))) if txt else str(id(event))
+
+def _schedule_limited_job(executor, registry: dict[str, Any], registry_lock: threading.Lock, key: str, fn, *args, **kwargs) -> bool:
+    with registry_lock:
+        old = registry.get(key)
+        if old is not None and not old.done():
+            return False
+        try:
+            fut = executor.submit(fn, *args, **kwargs)
+        except RuntimeError:
+            return False
+        registry[key] = fut
+        def _cleanup(done_fut):
+            with registry_lock:
+                if registry.get(key) is done_fut:
+                    registry.pop(key, None)
+            try:
+                exc = done_fut.exception()
+                if exc is not None:
+                    logger.error(f"{LP} background job failed key={key}: {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+            except Exception:
+                pass
+        fut.add_done_callback(_cleanup)
+        return True
+
+def _schedule_event_job(key: str, fn, *args, **kwargs) -> bool:
+    return _schedule_limited_job(_EVENT_EXECUTOR, _EVENT_JOBS, _EVENT_JOBS_LOCK, key, fn, *args, **kwargs)
+
+def _schedule_order_worker(cardinal, sess: dict[str, Any], mode: str = "login") -> bool:
+    oid = str(sess.get("order_id") or "noid").strip().lstrip("#")
+    key = f"{oid}:{mode}"
+    other_key = f"{oid}:qr" if mode == "login" else f"{oid}:login"
+
+    _cancel_qr_worker(oid, reason=f"reschedule_{mode}")
+
+    for target_key in (key, other_key):
+        with _ORDER_JOBS_LOCK:
+            old = _ORDER_JOBS.get(target_key)
+        if old is not None and not old.done():
+            logger.info(f"[{NAME}] [#{oid}] Ожидание завершения предыдущего воркера {target_key}...")
+            try:
+                old.result(timeout=6.0)
+            except Exception:
+                pass
+            with _ORDER_JOBS_LOCK:
+                if _ORDER_JOBS.get(target_key) is old and old.done():
+                    _ORDER_JOBS.pop(target_key, None)
+
+    with _ORDER_JOBS_LOCK:
+        if (key in _ORDER_JOBS and not _ORDER_JOBS[key].done()) or (other_key in _ORDER_JOBS and not _ORDER_JOBS[other_key].done()):
+            _log_event("order_job_busy", level=logging.WARNING, order_id=oid, mode=mode, reason="old_worker_still_running")
+            return False
+
+    if mode == "qr":
+        new_evt = threading.Event()
+        with _QR_CANCEL_EVENTS_LOCK:
+            _QR_CANCEL_EVENTS[oid] = new_evt
+        sess["cancel_qr_event"] = new_evt
+
+    fn = _run_qr_order_process if mode == "qr" else _run_order_process
+    scheduled = _schedule_limited_job(_ORDER_EXECUTOR, _ORDER_JOBS, _ORDER_JOBS_LOCK, key, fn, cardinal, sess)
+    if not scheduled:
+        _log_event("order_job_busy", level=logging.DEBUG, order_id=oid, mode=mode)
+    else:
+        _log_event("order_job_scheduled", level=logging.DEBUG, order_id=oid, mode=mode)
+    return scheduled
+
+def format_eta(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return f"{s} сек"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m} мин" + (f" {sec} сек" if sec else "")
+    h, m = divmod(m, 60)
+    return f"{h} ч" + (f" {m} мин" if m else "")
+def _is_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, (
+        asyncio.TimeoutError,
+        aiohttp.ServerConnectionError,
+        aiohttp.ClientConnectorError,
+        aiohttp.ClientOSError,
+        aiohttp.ServerDisconnectedError,
+        aiohttp.ClientPayloadError,
+        ConnectionResetError,
+        OSError,
+    )):
+        return True
+    msg = str(exc).lower()
+    return any(kw in msg for kw in (
+        "proxy", "tunnel", "connection", "timeout",
+        "reset by peer", "broken pipe", "eof",
+    ))
+def _is_proxy_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, (
+        asyncio.TimeoutError,
+        aiohttp.ServerTimeoutError,
+        aiohttp.ClientConnectorError,
+        ConnectionResetError,
+    )):
+        return True
+    msg = str(exc).lower()
+    return any(kw in msg for kw in (
+        "connection timeout", "connecttimeout", "timeouterror",
+        "clientconnectortimeout", "clientconnectorerror", "proxy timeout",
+        "connection reset", "timed out", "reset by peer", "broken pipe"
+    ))
+async def _net(coro_fn, *args, label: str = "", **kwargs):
+    result = await coro_fn(*args, **kwargs)
+    if hasattr(result, "status") and result.status in _RETRYABLE_HTTP:
+        raise aiohttp.ClientResponseError(
+            request_info=result.request_info,
+            history=(),
+            status=result.status,
+            message=f"HTTP {result.status}",
+        )
+    return result
+COUNTRY_NAMES: dict[str, str] = {
+    "RU": "🇷🇺 Россия",
+    "KZ": "🇰🇿 Казахстан",
+    "UA": "🇺🇦 Украина",
+    "GB": "🇬🇧 Великобритания",
+    "DE": "🇩🇪 Германия",
+    "CH": "🇨🇭 Швейцария",
+    "PL": "🇵🇱 Польша",
+    "SE": "🇸🇪 Швеция",
+    "BR": "🇧🇷 Бразилия",
+    "JP": "🇯🇵 Япония",
+    "ID": "🇮🇩 Индонезия",
+    "MY": "🇲🇾 Малайзия",
+    "PH": "🇵🇭 Филиппины",
+    "SG": "🇸🇬 Сингапур",
+    "TH": "🇹🇭 Таиланд",
+    "VN": "🇻🇳 Вьетнам",
+    "KR": "🇰🇷 Ю. Корея",
+    "TR": "🇹🇷 Турция",
+    "MX": "🇲🇽 Мексика",
+    "NZ": "🇳🇿 Нов. Зеландия",
+    "AR": "🇦🇷 Аргентина",
+    "CL": "🇨🇱 Чили",
+    "CO": "🇨🇴 Колумбия",
+    "PE": "🇵🇪 Перу",
+    "ZA": "🇿🇦 ЮАР",
+    "HK": "🇭🇰 Гонконг",
+    "TW": "🇹🇼 Тайвань",
+    "SA": "🇸🇦 Саудовская Аравия",
+    "IL": "🇮🇱 Израиль",
+    "KW": "🇰🇼 Кувейт",
+    "QA": "🇶🇦 Катар",
+    "CR": "🇨🇷 Коста-Рика",
+    "UY": "🇺🇾 Уругвай",
+    "BY": "🇧🇾 Беларусь",
+    "AZ": "🇦🇿 Азербайджан",
+    "GE": "🇬🇪 Грузия",
+}
+
+class RegionResult:
+    OK = "OK"
+    ALREADY = "ALREADY"
+    SENT = "SENT"
+    SKIP_FIXED = "SKIP_FIXED"
+    FAIL_WRONG_REGION = "FAIL_WRONG_REGION"
+    FAIL_NO_MAFILE = "FAIL_NO_MAFILE"
+    FAIL_WRONG_PASS = "FAIL_WRONG_PASS"
+    FAIL_WRONG_GUARD = "FAIL_WRONG_GUARD"
+    FAIL_RATE_LIMIT = "FAIL_RATE_LIMIT"
+    FAIL_SESSION = "FAIL_SESSION"
+    FAIL_CHANGE = "FAIL_CHANGE"
+    FAIL_VERIFY_REGION = "FAIL_VERIFY_REGION"
+    FAIL_PROXY = "FAIL_PROXY"
+    FAIL_TEMP_ERROR = "FAIL_TEMP_ERROR"
+    ERROR = "ERROR"
+    SKIPPED = "SKIPPED"
+class FailureReason:
+    PROXY_EXHAUSTED = "proxy_exhausted"
+    PROXY_TIMEOUT = "proxy_timeout"
+
+    ACCOUNT_FUNDED = "account_funded"
+    ACCOUNT_PURCHASED = "account_purchased"
+    ACCOUNT_KEY_ACTIVATED = "account_key_activated"
+    REGION_FIXED = "region_fixed"
+
+    WRONG_CREDENTIALS = "wrong_credentials"
+    WRONG_GUARD = "wrong_guard"
+
+    STEAM_TEMP_ERROR = "steam_temp_error"
+    STEAM_RATE_LIMIT = "steam_rate_limit"
+
+    QR_TIMEOUT = "qr_timeout"
+    USER_TIMEOUT = "user_timeout"
+
+    VERIFY_FAILED = "verify_failed"
+    CHECK_FAILED = "check_failed"
+    UNKNOWN = "unknown"
+
+@dataclass
+class AccountEligibility:
+    allowed: bool
+    reason: str = "ok"
+    wallet_funded: bool = False
+    purchased: bool = False
+    key_activated: bool = False
+    region_fixed: bool = False
+
+@dataclass
+class AccountRegionResult:
+    login: str
+    status: str
+    new_region: str | None = None
+    error: str | None = None
+    gift_results: list[tuple[str, bool, str]] = field(default_factory=list)
+    failure_reason: str | None = None
+    @property
+    def success(self) -> bool:
+        return self.status in (RegionResult.OK, RegionResult.ALREADY, RegionResult.SENT)
+    @property
+    def is_success(self) -> bool:
+        return self.success
+    @property
+    def gift_redeemed(self) -> bool:
+        return any(ok for _, ok, _ in self.gift_results)
+    @property
+    def skipped(self) -> bool:
+        return self.status == RegionResult.SKIP_FIXED
+    @property
+    def critical_wrong_region(self) -> bool:
+        return self.status == RegionResult.FAIL_WRONG_REGION
+@dataclass
+class BatchRegionResult:
+    country_code: str
+    total: int
+    results: list[AccountRegionResult] = field(default_factory=list)
+    @property
+    def ok(self) -> list[AccountRegionResult]:
+        return [r for r in self.results if r.success]
+    @property
+    def skipped(self) -> list[AccountRegionResult]:
+        return [r for r in self.results if r.skipped]
+    @property
+    def wrong_region(self) -> list[AccountRegionResult]:
+        return [r for r in self.results if r.critical_wrong_region]
+    @property
+    def failed(self) -> list[AccountRegionResult]:
+        return [r for r in self.results
+                if not r.success and not r.skipped and not r.critical_wrong_region
+                and r.status not in (RegionResult.SKIPPED, RegionResult.SENT)]
+    @property
+    def sent(self) -> list[AccountRegionResult]:
+        return [r for r in self.results if r.status == RegionResult.SENT]
+    @property
+    def user_skipped(self) -> list[AccountRegionResult]:
+        return [r for r in self.results if r.status == RegionResult.SKIPPED]
+    @property
+    def gift_ok(self) -> list[tuple[str, str]]:
+        return [(r.login, code) for r in self.results
+                for (code, ok, _msg) in r.gift_results if ok]
+    @property
+    def gift_failed(self) -> list[tuple[str, str, str]]:
+        return [(r.login, code, msg) for r in self.results
+                for (code, ok, msg) in r.gift_results if not ok]
+def _is_valid_port(p: Any) -> bool:
+    try:
+        val = int(str(p).strip())
+        return 1 <= val <= 65535
+    except (ValueError, TypeError):
+        return False
+
+def _is_ip_or_host(s: str) -> bool:
+    s = str(s or "").strip()
+    if not s:
+        return False
+    if s.lower() in ("localhost", "127.0.0.1"):
+        return True
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', s):
+        parts = s.split('.')
+        return all(0 <= int(x) <= 255 for x in parts)
+    if '.' in s and re.match(r'^[a-zA-Z0-9_\-\.]+$', s):
+        return True
+    if re.match(r'^[a-zA-Z0-9_\-]+$', s):
+        return True
+    return False
+
+def normalize_proxy_url(p: str) -> str:
+    p = (p or "").strip().strip("'\"` \t\r\n")
+    if not p:
+        return ""
+    scheme = "http"
+    m_scheme = re.match(r'^(https?|socks5h?|socks4a?)(?::/{1,3}|:)', p, re.IGNORECASE)
+    if m_scheme:
+        scheme = m_scheme.group(1).lower()
+        rest = p[m_scheme.end():]
+    elif "://" in p:
+        scheme_part, rest = p.split("://", 1)
+        if scheme_part.lower() in ("http", "https", "socks5", "socks5h", "socks4", "socks4a"):
+            scheme = scheme_part.lower()
+        else:
+            return ""
+    else:
+        rest = p
+
+    rest = rest.rstrip("/").strip()
+    if not rest:
+        return ""
+
+    if "@" in rest:
+        left, right = rest.rsplit("@", 1)
+        left = left.strip()
+        right = right.strip()
+        if ":" in right:
+            r_parts = right.split(":")
+            if len(r_parts) == 2 and _is_ip_or_host(r_parts[0]) and _is_valid_port(r_parts[1]):
+                if left:
+                    return f"{scheme}://{left}@{r_parts[0]}:{r_parts[1]}"
+                return f"{scheme}://{r_parts[0]}:{r_parts[1]}"
+        if ":" in left:
+            l_parts = left.split(":")
+            if len(l_parts) == 2 and _is_ip_or_host(l_parts[0]) and _is_valid_port(l_parts[1]):
+                if right:
+                    return f"{scheme}://{right}@{l_parts[0]}:{l_parts[1]}"
+                return f"{scheme}://{l_parts[0]}:{l_parts[1]}"
+        return ""
+
+    parts = rest.split(":")
+    if len(parts) == 2:
+        host, port = parts[0].strip(), parts[1].strip()
+        if _is_ip_or_host(host) and _is_valid_port(port):
+            return f"{scheme}://{host}:{port}"
+        return ""
+
+    if len(parts) == 4:
+        p0, p1, p2, p3 = [x.strip() for x in parts]
+        if _is_ip_or_host(p0) and _is_valid_port(p1):
+            return f"{scheme}://{p2}:{p3}@{p0}:{p1}"
+        elif _is_ip_or_host(p2) and _is_valid_port(p3):
+            return f"{scheme}://{p0}:{p1}@{p2}:{p3}"
+        elif _is_valid_port(p1) and not _is_valid_port(p3):
+            return f"{scheme}://{p2}:{p3}@{p0}:{p1}"
+        elif _is_valid_port(p3) and not _is_valid_port(p1):
+            return f"{scheme}://{p0}:{p1}@{p2}:{p3}"
+        return ""
+
+    if len(parts) > 4:
+        p0, p1 = parts[0].strip(), parts[1].strip()
+        if _is_ip_or_host(p0) and _is_valid_port(p1):
+            user = parts[2].strip()
+            pwd = ":".join(parts[3:]).strip()
+            return f"{scheme}://{user}:{pwd}@{p0}:{p1}"
+        last_host, last_port = parts[-2].strip(), parts[-1].strip()
+        if _is_ip_or_host(last_host) and _is_valid_port(last_port):
+            user = parts[0].strip()
+            pwd = ":".join(parts[1:-2]).strip()
+            return f"{scheme}://{user}:{pwd}@{last_host}:{last_port}"
+
+    return ""
+DEFAULT_STEAM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
+class ProxyRequestStrategy:
+    def __init__(self, proxy: str | None = None):
+        self._proxy = normalize_proxy_url(proxy) if proxy else None
+        self._session: ClientSession | None = None
+    def _get_session(self) -> ClientSession:
+        if self._session is None or self._session.closed:
+            cfg_to = REGION_REQUEST_TIMEOUT
+            try:
+                cfg_to = float(_load_config().get("request_timeout", REGION_REQUEST_TIMEOUT))
+            except Exception:
+                pass
+            connector = None
+            if self._proxy and self._proxy.lower().startswith(("socks4://", "socks5://", "socks5h://")):
+                try:
+                    import aiohttp_socks
+                    connector = aiohttp_socks.ProxyConnector.from_url(self._proxy, ssl=False)
+                except Exception as _ce:
+                    logger.warning(f"[{NAME}] Ошибка SOCKS коннектора: {_ce}")
+            if connector is None:
+                connector = aiohttp.TCPConnector(ssl=False)
+            self._session = ClientSession(
+                headers=dict(DEFAULT_STEAM_HEADERS),
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(
+                    total=cfg_to,
+                    connect=REGION_CONNECT_TIMEOUT,
+                    sock_connect=REGION_CONNECT_TIMEOUT,
+                ),
+            )
+        return self._session
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+    async def request(self, url: str, method: str = "GET", **kwargs: Any) -> ClientResponse:
+        session = self._get_session()
+        is_socks = bool(self._proxy and self._proxy.lower().startswith(("socks4://", "socks5://", "socks5h://")))
+        if is_socks:
+            kwargs.pop("proxy", None)
+            kwargs.pop("proxy_auth", None)
+        elif self._proxy and "proxy" not in kwargs:
+            kwargs["proxy"] = self._proxy
+            if "proxy_auth" not in kwargs:
+                try:
+                    from yarl import URL as _YURL
+                    _u = _YURL(self._proxy)
+                    if _u.user and _u.password:
+                        kwargs["proxy_auth"] = aiohttp.BasicAuth(_u.user, _u.password)
+                except Exception:
+                    pass
+        req_headers = dict(kwargs.get("headers") or {})
+        for hk, hv in DEFAULT_STEAM_HEADERS.items():
+            if hk not in req_headers:
+                req_headers[hk] = hv
+        if "api.steampowered.com" in url:
+            if "Origin" not in req_headers:
+                req_headers["Origin"] = "https://steamcommunity.com"
+            if "Referer" not in req_headers:
+                req_headers["Referer"] = "https://steamcommunity.com/login/home/?goto="
+        elif "steamcommunity.com" in url:
+            if "Referer" not in req_headers:
+                req_headers["Referer"] = "https://steamcommunity.com/"
+        elif "store.steampowered.com" in url:
+            if "Referer" not in req_headers:
+                req_headers["Referer"] = "https://store.steampowered.com/"
+        kwargs["headers"] = req_headers
+        logger.debug(f"[{NAME}] [HTTP {method}] {url} через {_mask_proxy(self._proxy or 'прямое соединение')}")
+        response = await session.request(method, url, **kwargs)
+        error = response.headers.get("X-eresult")
+        if error:
+            try:
+                from pysteamauth.errors import check_steam_error
+                check_steam_error(int(error))
+            except (ImportError, ValueError):
+                pass
+        return response
+    def cookies(self, domain: str = "steamcommunity.com") -> Mapping[str, str]:
+        session = self._get_session()
+        result = {}
+        for cookie in session.cookie_jar:
+            if cookie["domain"] == domain:
+                result[cookie.key] = cookie.value
+        return result
+    async def text(self, url: str, method: str = "GET", **kwargs: Any) -> str:
+        resp = await self.request(url, method, **kwargs)
+        return await resp.text()
+    async def bytes(self, url: str, method: str = "GET", **kwargs: Any) -> bytes:
+        resp = await self.request(url, method, **kwargs)
+        return await resp.read()
+def parse_store_page(html: str) -> dict:
+    country_code = None
+    wallet_currency = None
+    wallet_fixed = False
+    m = re.search(r'data-userinfo="([^"]+)"', html)
+    if m:
+        try:
+            raw = m.group(1).replace("&quot;", '"').replace("&amp;", "&")
+            data = json.loads(raw)
+            country_code = data.get("country_code")
+            wallet_currency = data.get("wallet_currency")
+            bal = data.get("wallet_balance", 0)
+            if bal and int(bal) > 0:
+                wallet_fixed = True
+        except Exception:
+            pass
+    return {
+        "country_code": country_code,
+        "wallet_fixed": wallet_fixed,
+        "wallet_currency": wallet_currency,
+    }
+def get_shared_secret_from_mafile(mafile_path: str | None) -> str | None:
+    if not mafile_path:
+        return None
+    try:
+        with open(mafile_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("shared_secret") or None
+    except Exception:
+        return None
+def find_shared_secret_in_dir(login: str, mafiles_dir: str) -> str | None:
+    p = Path(mafiles_dir)
+    if not p.is_dir():
+        return None
+    login_lower = login.lower()
+    for f in p.iterdir():
+        if f.suffix.lower() not in (".mafile", ".json"):
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        acc_name = (data.get("account_name") or "").lower()
+        stem = f.stem.lower()
+        if acc_name == login_lower or stem == login_lower or \
+           (acc_name and (login_lower.startswith(acc_name) or acc_name.startswith(login_lower))):
+            return data.get("shared_secret") or None
+    return None
+async def _safe_is_authorized(self) -> bool:
+    try:
+        cookies = await self._storage.get(
+            login=self._login,
+            domain="steamcommunity.com",
+        )
+        if not cookies:
+            return False
+        has_sess = bool(cookies.get("sessionid"))
+        has_sec = any("steamloginsecure" in str(k).lower() for k in cookies.keys())
+        return has_sess and has_sec
+    except Exception:
+        return False
+
+async def _try_import_pysteamauth():
+    try:
+        from pysteamauth.auth import Steam
+        Steam.is_authorized = _safe_is_authorized
+        return Steam
+    except ImportError:
+        return None
+class GuardCodeSkipped(Exception):
+    pass
+class GuardCodeRejected(Exception):
+    pass
+class SteamLoginFailed(Exception):
+    pass
+_ManualSteamClass = None
+
+async def _try_import_manual_steam():
+    global _ManualSteamClass
+    if _ManualSteamClass is not None:
+        return _ManualSteamClass
+    try:
+        from pysteamauth.auth import Steam
+        Steam.is_authorized = _safe_is_authorized
+        from pysteamauth.pb2.steammessages_auth.steamclient_pb2 import EAuthSessionGuardType
+        from urllib3.util import parse_url
+    except ImportError:
+        return None
+    class ManualGuardSteam(Steam):
+        _manual_code: str = ""
+        _guard_provider: GuardProvider | None = None
+        def set_guard_code(self, code: str) -> None:
+            self._manual_code = (code or "").strip().upper()
+        def set_guard_provider(self, provider: GuardProvider | None) -> None:
+            self._guard_provider = provider
+        def _encrypt_password(self, keys: Any) -> str:
+            import rsa
+            publickey_exp = int(keys.publickey_exp, 16)
+            publickey_mod = int(keys.publickey_mod, 16)
+            public_key = rsa.PublicKey(n=publickey_mod, e=publickey_exp)
+            pwd = str(self._password or "")
+            try:
+                msg_bytes = pwd.encode("utf-8")
+            except Exception:
+                msg_bytes = pwd.encode("ascii", errors="replace")
+            encrypted_password = rsa.encrypt(message=msg_bytes, pub_key=public_key)
+            return str(base64.b64encode(encrypted_password), "utf8")
+        async def is_authorized(self) -> bool:
+            return await _safe_is_authorized(self)
+        async def _begin_auth_session(
+            self,
+            encrypted_password: str,
+            rsa_timestamp: int,
+        ):
+            from pysteamauth.pb2.steammessages_auth.steamclient_pb2 import (
+                CAuthentication_BeginAuthSessionViaCredentials_Request,
+                CAuthentication_BeginAuthSessionViaCredentials_Response,
+                EAuthTokenPlatformType,
+            )
+            from aiohttp import FormData
+            try:
+                from pysteamauth.pb2.enums_pb2 import ESessionPersistence
+                sess_persist = ESessionPersistence.k_ESessionPersistence_Persistent
+            except Exception:
+                sess_persist = 1
+            message = CAuthentication_BeginAuthSessionViaCredentials_Request(
+                account_name=self._login,
+                encrypted_password=encrypted_password,
+                encryption_timestamp=rsa_timestamp,
+                remember_login=True,
+                platform_type=EAuthTokenPlatformType.k_EAuthTokenPlatformType_WebBrowser,
+                website_id="Community",
+                persistence=sess_persist,
+                device_friendly_name="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            )
+            response = await self._requests.bytes(
+                method="POST",
+                url="https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaCredentials/v1",
+                data=FormData(
+                    fields=[
+                        ("input_protobuf_encoded", str(base64.b64encode(message.SerializeToString()), "utf8")),
+                    ],
+                ),
+            )
+            return CAuthentication_BeginAuthSessionViaCredentials_Response.FromString(response)
+        async def login_to_steam(self) -> None:
+            if await self.is_authorized():
+                return
+            if not self._requests.cookies().get("sessionid"):
+                try:
+                    await self._requests.bytes(method="GET", url="https://steamcommunity.com/login/home/?goto=")
+                except Exception:
+                    await self._requests.bytes(method="GET", url="https://steamcommunity.com")
+
+            session = None
+            auth_session = None
+
+            for session_attempt in range(1, 3):
+                keys = await self._getrsakey()
+                encrypted_password = self._encrypt_password(keys)
+                auth_session = await self._begin_auth_session(
+                    encrypted_password=encrypted_password,
+                    rsa_timestamp=keys.timestamp,
+                )
+                c_types = [getattr(c, "confirmation_type", None) for c in getattr(auth_session, "allowed_confirmations", [])]
+                logger.info(
+                    f"[{self._login}] Steam auth_session начата (попытка {session_attempt}/2): client_id={getattr(auth_session, 'client_id', '')} "
+                    f"interval={getattr(auth_session, 'interval', 5)} confirmations={c_types}"
+                )
+                if not getattr(auth_session, "client_id", None):
+                    raise SteamLoginFailed("Не удалось получить сессию Steam (неверный логин или пароль)")
+
+                push_conf = None
+                device_conf = None
+                email_conf = None
+
+                for conf in getattr(auth_session, "allowed_confirmations", []):
+                    ct = getattr(conf, "confirmation_type", None)
+                    if ct in (getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_DeviceConfirmation', 4), 4):
+                        push_conf = conf
+                    elif ct in (getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_DeviceCode', 3), 3):
+                        device_conf = conf
+                    elif ct in (getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_EmailCode', 2),
+                                getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_EmailConfirmation', 5), 2, 5):
+                        email_conf = conf
+
+                has_email = email_conf is not None
+                has_machine = any(getattr(c, "confirmation_type", None) in (6, getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_MachineToken', 6)) for c in getattr(auth_session, "allowed_confirmations", []))
+                if has_email or has_machine:
+                    try:
+                        await self._requests.bytes(
+                            method="POST",
+                            url="https://login.steampowered.com/jwt/checkdevice",
+                            data={
+                                "clientid": str(auth_session.client_id),
+                                "steamid": str(auth_session.steamid),
+                            },
+                            headers={
+                                "Origin": "https://steamcommunity.com",
+                                "Referer": "https://steamcommunity.com",
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                            },
+                        )
+                        logger.info(f"[{self._login}] checkdevice выполнен: Steam инициировал отправку кода на почту")
+                    except Exception as _cd_e:
+                        logger.debug(f"[{self._login}] checkdevice: {_cd_e}")
+
+                poll_interval = max(2, int(getattr(auth_session, "interval", 3) or 3))
+
+                if push_conf is not None:
+                    logger.info(f"[{self._login}] Выбран способ подтверждения: Steam Mobile Push (тип 4)")
+                    if self._guard_provider is not None:
+                        try:
+                            await self._guard_provider(self._login, guard_type="push", guard_detail="Steam Mobile App")
+                        except Exception:
+                            pass
+                    device_code_type = getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_DeviceCode', 3)
+                    for _poll_i in range(30):
+                        await asyncio.sleep(poll_interval)
+                        if self._guard_provider is not None and device_conf is not None:
+                            try:
+                                push_code = (await self._guard_provider(
+                                    self._login,
+                                    guard_type="push_code",
+                                    guard_detail="Steam Mobile App",
+                                ) or "").strip().upper()
+                            except Exception:
+                                push_code = ""
+                            if push_code:
+                                logger.info(f"[{self._login}] Получен 5-значный код Steam Guard во время Mobile Push, отправляем в Steam...")
+                                try:
+                                    await self._update_auth_session(
+                                        client_id=auth_session.client_id,
+                                        steamid=auth_session.steamid,
+                                        code=push_code,
+                                        code_type=device_code_type,
+                                    )
+                                except Exception as _code_err:
+                                    err_code = getattr(_code_err, "error_code", None)
+                                    err_msg = str(getattr(_code_err, "error_msg", "") or str(_code_err))
+                                    logger.warning(f"[{self._login}] Код Steam Guard из Mobile Push отклонён: {err_code} {err_msg}")
+                                    if err_code in (65, 88) or "twofactorcodemismatch" in err_msg.lower() or "invalidloginauthcode" in err_msg.lower():
+                                        try:
+                                            await self._guard_provider(
+                                                self._login,
+                                                guard_type="push_code_invalid",
+                                                guard_detail="Steam Mobile App",
+                                            )
+                                        except Exception:
+                                            pass
+                        try:
+                            session = await self._poll_auth_session_status(
+                                client_id=auth_session.client_id,
+                                request_id=auth_session.request_id,
+                            )
+                        except Exception as _p_err:
+                            logger.debug(f"[{self._login}] Poll push status: {_p_err}")
+                            session = None
+                        if session and session.refresh_token:
+                            break
+                    if session and session.refresh_token:
+                        break
+                    else:
+                        raise SteamLoginFailed("Требуется подтвердить вход в мобильном приложении Steam (Steam Guard Push)")
+
+                target_conf = device_conf or email_conf
+                if target_conf is not None:
+                    c_type = getattr(target_conf, "confirmation_type", None)
+                    is_email = (target_conf is email_conf)
+                    guard_type_str = "email" if is_email else "device"
+                    guard_detail_str = getattr(target_conf, "associated_message", "") or ""
+                    code_type = getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_EmailCode', 2) if is_email else getattr(EAuthSessionGuardType, 'k_EAuthSessionGuardType_DeviceCode', 3)
+                    logger.info(f"[{self._login}] Выбран способ подтверждения: {guard_type_str} (тип {c_type})")
+
+                    invalid_code_attempts = 0
+                    max_code_attempts = 3
+                    stale_session_needed = False
+
+                    while invalid_code_attempts < max_code_attempts:
+                        if self._guard_provider is not None:
+                            try:
+                                code = (await self._guard_provider(
+                                    self._login,
+                                    guard_type=guard_type_str,
+                                    guard_detail=guard_detail_str,
+                                    is_retry=(invalid_code_attempts > 0),
+                                ) or "").strip().upper()
+                            except TypeError:
+                                code = (await self._guard_provider(self._login) or "").strip().upper()
+                        else:
+                            code = self._manual_code
+
+                        if not code:
+                            raise GuardCodeSkipped()
+
+                        logger.info(f"[{self._login}] Отправка Guard-кода в Steam (попытка {invalid_code_attempts + 1}/{max_code_attempts})...")
+                        from pysteamauth.errors.exceptions import SteamError
+
+                        try:
+                            await self._update_auth_session(
+                                client_id=auth_session.client_id,
+                                steamid=auth_session.steamid,
+                                code=code,
+                                code_type=code_type,
+                            )
+                            logger.info(f"[{self._login}] Guard-код отправлен в Steam, начинаем polling...")
+                            for _poll_i in range(12):
+                                await asyncio.sleep(poll_interval)
+                                try:
+                                    session = await self._poll_auth_session_status(
+                                        client_id=auth_session.client_id,
+                                        request_id=auth_session.request_id,
+                                    )
+                                except Exception as _p_err:
+                                    logger.debug(f"[{self._login}] Poll status: {_p_err}")
+                                    session = None
+                                if session and session.refresh_token:
+                                    break
+                            if session and session.refresh_token:
+                                break
+                            else:
+                                logger.warning(f"[{self._login}] Refresh token не получен после polling")
+                                invalid_code_attempts += 1
+                                if invalid_code_attempts >= max_code_attempts:
+                                    raise GuardCodeRejected("Guard-код не принят Steam (не получен refresh_token)")
+                                continue
+
+                        except SteamError as e:
+                            err_code = getattr(e, "error_code", None)
+                            err_msg = str(getattr(e, "error_msg", "") or str(e))
+
+                            if err_code == 29 or "duplicaterequest" in err_msg.lower():
+                                logger.info(
+                                    f"[{self._login}] Steam вернул DuplicateRequest (код 29). "
+                                    f"Не считаем ошибкой Guard, опрашиваем текущую auth-session..."
+                                )
+                                _log_event("steam_guard_duplicate_request", login=self._login, client_id=str(auth_session.client_id))
+                                dup_session = None
+                                for _dup_i in range(7):
+                                    await asyncio.sleep(2.5)
+                                    try:
+                                        dup_session = await self._poll_auth_session_status(
+                                            client_id=auth_session.client_id,
+                                            request_id=auth_session.request_id,
+                                        )
+                                    except Exception as _p_err:
+                                        logger.debug(f"[{self._login}] Poll status (DuplicateRequest): {_p_err}")
+                                        dup_session = None
+                                    if dup_session and dup_session.refresh_token:
+                                        logger.info(f"[{self._login}] Успешно получен refresh_token после DuplicateRequest!")
+                                        session = dup_session
+                                        break
+
+                                if session and session.refresh_token:
+                                    break
+                                else:
+
+                                    logger.warning(
+                                        f"[{self._login}] DuplicateRequest не восстановился через polling. "
+                                        f"Сбрасываем проблемную auth-session и создаём новую..."
+                                    )
+                                    stale_session_needed = True
+                                    break
+
+                            elif err_code in (65, 88) or "twofactorcodemismatch" in err_msg.lower() or "invalidloginauthcode" in err_msg.lower():
+                                invalid_code_attempts += 1
+                                logger.warning(f"[{self._login}] Неверный Guard-код Steam (код ошибки {err_code}, попытка {invalid_code_attempts}/{max_code_attempts})")
+                                if invalid_code_attempts >= max_code_attempts:
+                                    raise GuardCodeRejected(f"Guard-код не принят Steam (код ошибки {err_code})")
+                                continue
+
+                            elif err_code == 84 or "ratelimit" in err_msg.lower():
+                                raise SteamLoginFailed("Превышен лимит запросов Steam (RateLimitExceeded)")
+
+                            else:
+                                invalid_code_attempts += 1
+                                logger.warning(f"[{self._login}] Steam отклонил Guard-код (код ошибки {err_code}): {e}")
+                                if invalid_code_attempts >= max_code_attempts:
+                                    raise GuardCodeRejected(f"Guard-код не принят Steam (код ошибки {err_code})")
+                                continue
+
+                    if session and session.refresh_token:
+                        break
+                    if stale_session_needed:
+                        if session_attempt < 2:
+                            logger.info(f"[{self._login}] Повторная инициализация auth_session после DuplicateRequest...")
+                            continue
+                        else:
+                            raise GuardCodeRejected("Steam DuplicateRequest: не удалось восстановить сессию подтверждения")
+
+                else:
+                    try:
+                        session = await self._poll_auth_session_status(
+                            client_id=auth_session.client_id,
+                            request_id=auth_session.request_id,
+                        )
+                    except Exception:
+                        pass
+                    if session and session.refresh_token:
+                        break
+                    else:
+                        if auth_session.allowed_confirmations:
+                            c_names = [str(getattr(c, "confirmation_type", c)) for c in auth_session.allowed_confirmations]
+                            raise SteamLoginFailed(f"Требуется подтверждение Steam: {', '.join(c_names)}")
+                        raise SteamLoginFailed("Не удалось получить сессию Steam (неверный логин или пароль)")
+
+            if not session or not session.refresh_token:
+                raise SteamLoginFailed("Не удалось получить сессию Steam (отсутствует refresh_token)")
+
+            tokens = await self._finalize_login(
+                refresh_token=session.refresh_token,
+                sessionid=self._requests.cookies()["sessionid"],
+            )
+            for token in tokens.transfer_info:
+                await self._set_token(
+                    url=token.url,
+                    nonce=token.params.nonce,
+                    auth=token.params.auth,
+                    steamid=auth_session.steamid,
+                )
+            if not self._steamid and tokens.steamID:
+                self._steamid = int(tokens.steamID)
+            cookies = {"steamcommunity.com": self._requests.cookies("steamcommunity.com")}
+            for url in ("https://store.steampowered.com", "https://help.steampowered.com"):
+                await self._requests.bytes(url, "GET")
+                cookies.update({parse_url(url).host: self._requests.cookies(parse_url(url).host)})
+            await self._storage.set(login=self._login, cookies=cookies)
+    _ManualSteamClass = ManualGuardSteam
+    return _ManualSteamClass
+class QRLoginTimeout(Exception):
+    pass
+class QRLoginCancelled(Exception):
+    pass
+_QRSteamClass = None
+
+async def _try_import_qr_steam():
+    global _QRSteamClass
+    if _QRSteamClass is not None:
+        return _QRSteamClass
+    try:
+        from aiohttp import FormData
+        from pysteamauth.auth import Steam
+        from pysteamauth.pb2.steammessages_auth.steamclient_pb2 import (
+            CAuthentication_BeginAuthSessionViaQR_Request,
+            CAuthentication_BeginAuthSessionViaQR_Response,
+            EAuthTokenPlatformType,
+        )
+        from urllib3.util import parse_url
+    except ImportError:
+        return None
+    class QRSteam(Steam):
+        account_name: str = ""
+        async def _begin_qr(self):
+            message = CAuthentication_BeginAuthSessionViaQR_Request(
+                device_friendly_name="Mozilla/5.0 (X11; Linux x86_64; rv:1.9.5.20) "
+                                     "Gecko/2812-12-10 04:56:28 Firefox/3.8",
+                platform_type=EAuthTokenPlatformType.k_EAuthTokenPlatformType_WebBrowser,
+            )
+            response = await self._requests.bytes(
+                method="POST",
+                url="https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaQR/v1",
+                data=FormData(fields=[
+                    ("input_protobuf_encoded", str(base64.b64encode(message.SerializeToString()), "utf8")),
+                ]),
+            )
+            return CAuthentication_BeginAuthSessionViaQR_Response.FromString(response)
+        async def login_via_qr(
+            self,
+            display_cb: QRDisplay,
+            poll_timeout: float = 180.0,
+            confirmed_cb: Optional[Callable[[str], Awaitable[None]]] = None,
+            cancel_event: Optional[threading.Event] = None,
+            order_id: str = "",
+        ) -> str:
+            oid_log = order_id or self.account_name or "(qr)"
+            if cancel_event and cancel_event.is_set():
+                _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_pre_login")
+                raise QRLoginCancelled("QR-авторизация отменена")
+            if not self._requests.cookies().get("sessionid"):
+                await self._requests.bytes(method="GET", url="https://steamcommunity.com")
+            if cancel_event and cancel_event.is_set():
+                _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_post_cookie")
+                raise QRLoginCancelled("QR-авторизация отменена")
+            qr = await self._begin_qr()
+            client_id = qr.client_id
+            request_id = qr.request_id
+            interval = qr.interval or 2.0
+            last_url = qr.challenge_url
+
+            if cancel_event and cancel_event.is_set():
+                _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_post_begin")
+                raise QRLoginCancelled("QR-авторизация отменена")
+            await display_cb(last_url)
+            deadline = time.monotonic() + poll_timeout
+            refresh_token = None
+            while time.monotonic() < deadline:
+                if cancel_event and cancel_event.is_set():
+                    _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_in_poll")
+                    raise QRLoginCancelled("QR-авторизация отменена")
+                sleep_end = time.monotonic() + max(1.0, interval)
+                while time.monotonic() < sleep_end:
+                    if cancel_event and cancel_event.is_set():
+                        _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_during_sleep")
+                        raise QRLoginCancelled("QR-авторизация отменена")
+                    await asyncio.sleep(min(0.2, max(0.05, sleep_end - time.monotonic())))
+                if cancel_event and cancel_event.is_set():
+                    _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_pre_poll_request")
+                    raise QRLoginCancelled("QR-авторизация отменена")
+                try:
+                    session = await self._poll_auth_session_status(
+                        client_id=client_id, request_id=request_id,
+                    )
+                except Exception as poll_err:
+                    if cancel_event and cancel_event.is_set():
+                        _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_on_poll_err")
+                        raise QRLoginCancelled("QR-авторизация отменена")
+                    err_code = getattr(poll_err, "error_code", None)
+                    err_str = str(poll_err).lower()
+                    if (
+                        err_code in (9, 42, 2, 16)
+                        or "filenotfound" in err_str
+                        or "code': 9" in err_str
+                        or "code': 42" in err_str
+                        or "code': 2" in err_str
+                    ):
+                        logger.info(f"[QR] Steam сессия QR истекла или завершена (код {err_code or 9})")
+                        raise QRLoginTimeout("QR-код не подтверждён (истекло время действия кода)")
+                    if _is_network_error(poll_err):
+                        continue
+                    raise
+                if session.new_client_id:
+                    client_id = session.new_client_id
+                if session.refresh_token:
+                    refresh_token = session.refresh_token
+                    if session.account_name:
+                        self.account_name = session.account_name
+                    if confirmed_cb:
+                        try:
+                            await confirmed_cb(self.account_name)
+                        except Exception:
+                            pass
+                    break
+            if cancel_event and cancel_event.is_set():
+                _log_event("qr_worker_cancelled", order_id=oid_log, reason="cancelled_post_poll")
+                raise QRLoginCancelled("QR-авторизация отменена")
+            if not refresh_token:
+                raise QRLoginTimeout("QR-код не подтверждён (истекло время ожидания)")
+            tokens = await self._finalize_login(
+                refresh_token=refresh_token,
+                sessionid=self._requests.cookies()["sessionid"],
+            )
+            steamid = int(tokens.steamID) if tokens.steamID else 0
+            for token in tokens.transfer_info:
+                await self._set_token(
+                    url=token.url,
+                    nonce=token.params.nonce,
+                    auth=token.params.auth,
+                    steamid=steamid,
+                )
+            if steamid:
+                self._steamid = steamid
+            cookies = {"steamcommunity.com": self._requests.cookies("steamcommunity.com")}
+            for url in ("https://store.steampowered.com", "https://help.steampowered.com"):
+                await self._requests.bytes(url, "GET")
+                cookies.update({parse_url(url).host: self._requests.cookies(parse_url(url).host)})
+            await self._storage.set(login=self._login, cookies=cookies)
+            return self.account_name
+    _QRSteamClass = QRSteam
+    return _QRSteamClass
+
+async def set_country_raw(strategy: ProxyRequestStrategy, cc: str, session_id: str) -> bool:
+    hdrs = {"X-Requested-With": "XMLHttpRequest"}
+    ok_store = ok_chk = False
+    try:
+        resp = await strategy.request(
+            URL_SET_COUNTRY, method="POST",
+            data=aiohttp.FormData(fields=[("sessionid", session_id), ("cc", cc)]),
+            headers={**hdrs, "Origin": "https://store.steampowered.com",
+                     "Referer": "https://store.steampowered.com/account/"},
+        )
+        st = getattr(resp, "status", 0)
+        ok_store = (200 <= st < 300)
+        body = ""
+        try:
+            if hasattr(resp, "text"):
+                body = await resp.text() if asyncio.iscoroutinefunction(resp.text) else resp.text()
+            else:
+                body = str(resp)
+        except Exception:
+            body = ""
+        body_snip = body.strip().replace("\n", " ").replace("\r", " ")[:120]
+        _log_event("setcountry_response", target=cc, endpoint="store", status=st, response=body_snip)
+        logger.info(f"setcountry store HTTP {st} response: {body_snip}")
+    except Exception as e:
+        logger.debug(f"set_country store error: {e}")
+        _log_event("setcountry_response", target=cc, endpoint="store", status="error", error=str(e)[:60])
+    try:
+        resp = await strategy.request(
+            URL_SET_COUNTRY_CHK, method="POST",
+            data=aiohttp.FormData(fields=[("sessionid", session_id), ("cc", cc)]),
+            headers={**hdrs, "Origin": "https://checkout.steampowered.com",
+                     "Referer": "https://checkout.steampowered.com/"},
+        )
+        st = getattr(resp, "status", 0)
+        ok_chk = (200 <= st < 300)
+        body = ""
+        try:
+            if hasattr(resp, "text"):
+                body = await resp.text() if asyncio.iscoroutinefunction(resp.text) else resp.text()
+            else:
+                body = str(resp)
+        except Exception:
+            body = ""
+        body_snip = body.strip().replace("\n", " ").replace("\r", " ")[:120]
+        _log_event("setcountry_response", target=cc, endpoint="checkout", status=st, response=body_snip)
+        logger.info(f"setcountry checkout HTTP {st} response: {body_snip}")
+    except Exception as e:
+        logger.debug(f"set_country checkout error: {e}")
+        _log_event("setcountry_response", target=cc, endpoint="checkout", status="error", error=str(e)[:60])
+    return ok_store or ok_chk
+
+_REDEEM_DETAIL = {
+    0: "NoDetail",
+    2: "InsufficientFunds",
+    13: "RestrictedCountry (регион ограничен)",
+    14: "BadActivationCode (неверный код — ожидаемо для fake-redeem)",
+    15: "DuplicateActivationCode (код уже использован)",
+    23: "StoreBillingCountryMismatch (страна биллинга не совпадает)",
+    48: "NoWallet (у аккаунта нет кошелька — Steam не создаёт его этим способом)",
+    53: "RateLimited",
+}
+
+def _decode_redeem_body(body: str) -> str:
+    try:
+        j = json.loads(body)
+        d = j.get("detail")
+        if d in _REDEEM_DETAIL:
+            return f"{body} → detail={d}: {_REDEEM_DETAIL[d]}"
+    except Exception:
+        pass
+    return body
+
+async def trigger_wallet_raw(strategy: ProxyRequestStrategy, session_id: str) -> str:
+    fake = "".join(random.choices("ABCDEFGHJKMNPQRTVWXY23456789", k=15))
+    fake = f"{fake[:5]}-{fake[5:10]}-{fake[10:15]}"
+    try:
+        resp = await strategy.request(
+            URL_REDEEM, method="POST",
+            data=aiohttp.FormData(fields=[("wallet_code", fake), ("sessionid", session_id)]),
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://store.steampowered.com",
+                "Referer": "https://store.steampowered.com/account/",
+            },
+        )
+        try:
+            raw_text = await resp.text()
+            detail_val = 14
+            result_val = "BadActivationCode"
+            try:
+                j = json.loads(raw_text)
+                detail_val = j.get("detail", 14)
+                result_val = _REDEEM_DETAIL.get(detail_val, "BadActivationCode")
+            except Exception:
+                pass
+            _log_event("wallet_redeem_probe", detail=detail_val, result=result_val)
+            return _decode_redeem_body(raw_text[:300])
+        except Exception:
+            _log_event("wallet_redeem_probe", detail=14, result="BadActivationCode")
+            return f"<HTTP {getattr(resp, 'status', '?')}, тело не прочитано>"
+    except Exception as e:
+        _log_event("wallet_redeem_probe", detail="error", result=str(e)[:50])
+        return f"<ошибка запроса: {str(e)[:120]}>"
+async def check_proxy(proxy_url: str, timeout: float = 8.0) -> tuple[bool, str]:
+    clean_p = _mask_proxy(proxy_url)
+    p_url = normalize_proxy_url(proxy_url)
+    if not p_url:
+        _log_event("proxy_check", level=logging.WARNING, status="fail", proxy=clean_p, err="invalid_url")
+        return False, "пустой/неверный URL"
+    t0 = time.monotonic()
+    country_code = "??"
+    geo_ok = False
+    geo_err = ""
+    geo_endpoints = [
+        ("http://ip-api.com/json/", "countryCode"),
+        ("https://ipwho.is/", "country_code"),
+        ("https://api.myip.com", "cc"),
+    ]
+    is_socks = bool(p_url and p_url.lower().startswith(("socks4://", "socks5://", "socks5h://")))
+    connector = None
+    if is_socks:
+        try:
+            import aiohttp_socks
+            connector = aiohttp_socks.ProxyConnector.from_url(p_url, ssl=False)
+        except Exception:
+            pass
+    if connector is None:
+        connector = aiohttp.TCPConnector(ssl=False)
+    client_timeout = aiohttp.ClientTimeout(total=timeout, connect=max(3.0, timeout / 2))
+    proxy_arg = None if is_socks else p_url
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=client_timeout) as session:
+            for geo_url, key in geo_endpoints:
+                try:
+                    async with session.get(geo_url, proxy=proxy_arg) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            if isinstance(data, dict):
+                                val = data.get(key)
+                                if val:
+                                    country_code = str(val).upper()
+                                    geo_ok = True
+                                    break
+                        else:
+                            geo_err = f"HTTP {resp.status}"
+                except asyncio.TimeoutError:
+                    geo_err = "таймаут"
+                except Exception as e:
+                    geo_err = str(e)[:60]
+            try:
+                async with session.get(
+                    "https://store.steampowered.com/",
+                    proxy=proxy_arg,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                ) as resp:
+                    elapsed = time.monotonic() - t0
+                    ms = int(elapsed * 1000)
+                    if resp.status in (200, 301, 302):
+                        _log_event("proxy_check", status="ok", proxy=clean_p, country=country_code, steam="OK", http=resp.status, ms=ms)
+                        return True, country_code
+                    else:
+                        _log_event("proxy_check", level=logging.WARNING, status="fail", proxy=clean_p, err=f"Steam HTTP {resp.status}", ms=ms)
+                        return False, f"Steam HTTP {resp.status}"
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - t0
+                _log_event("proxy_check", level=logging.WARNING, status="fail", proxy=clean_p, err="SteamTimeout", ms=int(elapsed * 1000))
+                return False, "таймаут Steam"
+            except Exception as e:
+                elapsed = time.monotonic() - t0
+                err_msg = _mask_proxy(str(e))[:80]
+                _log_event("proxy_check", level=logging.WARNING, status="fail", proxy=clean_p, err=err_msg, ms=int(elapsed * 1000))
+                return False, f"Steam: {err_msg}"
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - t0
+        _log_event("proxy_check", level=logging.WARNING, status="fail", proxy=clean_p, err="Timeout", ms=int(elapsed * 1000))
+        return False, "таймаут"
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        err_msg = _mask_proxy(str(e))[:80]
+        _log_event("proxy_check", level=logging.WARNING, status="fail", proxy=clean_p, err=err_msg, ms=int(elapsed * 1000))
+        return False, err_msg
+async def check_proxies_for_country(
+    proxies: list[str],
+    expected_cc: str,
+    max_check: int = 10,
+) -> tuple[list[str], list[str]]:
+    check_list = proxies[:max_check] if max_check > 0 else proxies
+    _log_event("country_check_start", country=expected_cc, count=len(check_list), total=len(proxies))
+    good, bad = [], []
+    tasks = [check_proxy(p) for p in check_list]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for proxy, result in zip(check_list, results):
+        clean_p = _mask_proxy(proxy)
+        if isinstance(result, tuple) and result[0]:
+            cc = result[1]
+            if cc == expected_cc.upper() or expected_cc == "ANY":
+                good.append(proxy)
+                _log_event("country_proxy_result", status="ok", proxy=clean_p, country=cc)
+            else:
+                bad.append(proxy)
+                _log_event("country_proxy_result", level=logging.WARNING, status="fail", proxy=clean_p, reason=f"WrongCountry ({cc} != {expected_cc})")
+        else:
+            bad.append(proxy)
+            err_str = result[1] if isinstance(result, tuple) else str(result)[:60]
+            _log_event("country_proxy_result", level=logging.WARNING, status="fail", proxy=clean_p, reason=err_str)
+    _log_event("country_check_summary", country=expected_cc, good=len(good), bad=len(bad))
+    return good, bad
+def _parse_steam_balance(text: str) -> float:
+    if not text:
+        return 0.0
+    m = re.search(r'(\d+[\d\s]*(?:[.,]\d+)?)', str(text))
+    if m:
+        num_str = re.sub(r'\s+', '', m.group(1)).replace(',', '.')
+        try:
+            return float(num_str)
+        except Exception:
+            pass
+    return 0.0
+async def check_account_eligibility(steam, login: str = "") -> AccountEligibility:
+    _log_event("account_eligibility_check", login=login)
+    cfg = _load_config()
+    if not cfg.get("check_steam_funding", True):
+        _log_event("account_eligibility_ok", login=login, note="check_disabled")
+        return AccountEligibility(allowed=True, reason="ok")
+
+    net_errors: list[str] = []
+
+    try:
+        html_funds = await _net(steam.request, URL_ADDFUNDS, label=login)
+        parsed = parse_store_page(html_funds)
+        if parsed.get("wallet_fixed"):
+            logger.warning(f"[{login}] Кошелёк Steam уже зафиксирован на addfunds (были пополнения)")
+            _log_event("account_eligibility_failed", login=login, reason="region_fixed")
+            return AccountEligibility(
+                allowed=False,
+                reason=FailureReason.REGION_FIXED,
+                region_fixed=True,
+            )
+    except Exception as e:
+        logger.warning(f"[{login}] Ошибка проверки addfunds: {e}")
+        net_errors.append(f"addfunds: {e}")
+
+    try:
+        html_history = await _net(steam.request, URL_ACCOUNT_HISTORY, label=login)
+        rows = re.findall(r'<tr[^>]*class="[^"]*(?:transactionRow|wallet_table_row)[^"]*"[^>]*>(.*?)</tr>', html_history, re.DOTALL | re.IGNORECASE)
+        for r in rows:
+            m_type = re.search(r'class="[^"]*wht_type[^"]*"[^>]*>(.*?)</td>', r, re.DOTALL | re.IGNORECASE)
+            type_text = re.sub(r'<[^>]+>', ' ', m_type.group(1)).strip() if m_type else ''
+            m_items = re.search(r'class="[^"]*wht_items[^"]*"[^>]*>(.*?)</td>', r, re.DOTALL | re.IGNORECASE)
+            items_text = re.sub(r'<[^>]+>', ' ', m_items.group(1)).strip() if m_items else ''
+
+            if (
+                re.search(r'(?:gift|guest\s*pass|подарок|гостев|получен\s*подарок|отправлен\s*подарок)', type_text, re.IGNORECASE)
+                or re.search(r'(?:gift|guest\s*pass|подарок|гостев)', items_text, re.IGNORECASE)
+            ):
+                logger.info(f"[{login}] В истории найден подарок ({type_text}: {items_text}) — разрешено, пропускаем.")
+                _log_event("account_transaction_classified", login=login, classification="gift_allowed", source="match", type=type_text, items=items_text)
+                continue
+
+            if (
+                re.search(r'(?:add\s*funds|пополнени[ея]\s*кошелька|wallet\s*credit|пополнени[ея]\s*баланса|fund\s*wallet)', type_text, re.IGNORECASE)
+                or (re.search(r'(?:steam\s*wallet|кошелек\s*steam|кошелёк\s*steam)', items_text, re.IGNORECASE)
+                    and not re.search(r'(?:покупка|purchase|рынок|market|in-game)', type_text, re.IGNORECASE))
+            ):
+                logger.warning(f"[{login}] Обнаружено пополнение Steam Wallet в истории ({type_text}: {items_text})")
+                _log_event("account_transaction_classified", login=login, classification="account_funded", source="match", type=type_text, items=items_text)
+                _log_event("account_eligibility_failed", login=login, reason="wallet_funded", detail=f"{type_text}: {items_text}")
+                return AccountEligibility(
+                    allowed=False,
+                    reason=FailureReason.ACCOUNT_FUNDED,
+                    wallet_funded=True,
+                )
+
+            is_explicit_purchase = bool(
+                re.search(r'(?:покупка|purchase|рынок|market|in-game|внутриигров|торгов)', type_text, re.IGNORECASE)
+                or re.search(r'(?:покупка|purchase)', items_text, re.IGNORECASE)
+            )
+            source_tag = "explicit" if is_explicit_purchase else "fallback"
+            logger.warning(f"[{login}] На аккаунте обнаружены покупки Steam ({type_text}: {items_text}) [source={source_tag}]")
+            _log_event(
+                "account_transaction_classified",
+                login=login,
+                classification="account_purchased",
+                source=source_tag,
+                type=type_text,
+                items=items_text,
+            )
+            _log_event("account_eligibility_failed", login=login, reason="account_purchased", detail=f"{type_text}: {items_text}", source=source_tag)
+            return AccountEligibility(
+                allowed=False,
+                reason=FailureReason.ACCOUNT_PURCHASED,
+                purchased=True,
+            )
+    except Exception as e:
+        logger.warning(f"[{login}] Ошибка проверки истории транзакций: {e}")
+        net_errors.append(f"history: {e}")
+
+    try:
+        html_licenses = await _net(steam.request, URL_ACCOUNT_LICENSES, label=login)
+        rows_lic = re.findall(r'<tr[^>]*>(.*?)</tr>', html_licenses, re.DOTALL | re.IGNORECASE)
+        for r in rows_lic:
+            m_acq = re.search(r'class="[^"]*license_acquisition_col[^"]*"[^>]*>(.*?)</td>', r, re.DOTALL | re.IGNORECASE)
+            acq_text = re.sub(r'<[^>]+>', ' ', m_acq.group(1)).strip() if m_acq else ''
+            if not acq_text:
+                tds = re.findall(r'<td[^>]*>(.*?)</td>', r, re.DOTALL | re.IGNORECASE)
+                if len(tds) >= 2:
+                    acq_text = re.sub(r'<[^>]+>', ' ', tds[-1]).strip()
+
+            if re.search(r'(?:gift|guest\s*pass|подарок|гостев)', acq_text, re.IGNORECASE):
+                logger.info(f"[{login}] На странице лицензий найден подарок ({acq_text}) — разрешено, пропускаем.")
+                continue
+
+            if re.search(r'(?:retail|cd[- ]?key|product[- ]?key|steam[- ]?key|розничн|цифров.*ключ)', acq_text, re.IGNORECASE):
+                logger.warning(f"[{login}] Обнаружена активация ключа Steam на странице лицензий ({acq_text})")
+                _log_event("account_eligibility_failed", login=login, reason="key_activated", detail=acq_text)
+                return AccountEligibility(
+                    allowed=False,
+                    reason=FailureReason.ACCOUNT_KEY_ACTIVATED,
+                    key_activated=True,
+                )
+    except Exception as e:
+        logger.warning(f"[{login}] Ошибка проверки страницы лицензий: {e}")
+        net_errors.append(f"licenses: {e}")
+
+    try:
+        html_acc = await _net(steam.request, URL_ACCOUNT, label=login)
+        m_bal = re.search(r'accountData\s+price[^>]*>([^<]+)<', html_acc, re.IGNORECASE)
+        if m_bal:
+            bal_text = m_bal.group(1).strip()
+            bal_val = _parse_steam_balance(bal_text)
+            if bal_val > 0.0:
+                logger.warning(f"[{login}] На балансе аккаунта обнаружены средства: {bal_text}")
+                _log_event("account_eligibility_failed", login=login, reason="wallet_funded", detail=f"balance: {bal_text}")
+                return AccountEligibility(
+                    allowed=False,
+                    reason=FailureReason.ACCOUNT_FUNDED,
+                    wallet_funded=True,
+                )
+    except Exception as e:
+        logger.debug(f"[{login}] Ошибка проверки баланса на странице аккаунта: {e}")
+
+    if net_errors:
+        logger.warning(f"[{login}] Не удалось проверить пригодность аккаунта из-за сетевых ошибок: {net_errors}")
+        _log_event("account_eligibility_failed", login=login, reason="check_failed", errors=net_errors)
+        return AccountEligibility(
+            allowed=False,
+            reason=FailureReason.CHECK_FAILED,
+        )
+
+    _log_event("account_eligibility_ok", login=login)
+    return AccountEligibility(allowed=True, reason="ok")
+
+async def check_account_steam_funding(steam, login: str = "") -> tuple[bool, str]:
+    res = await check_account_eligibility(steam, login=login)
+    if not res.allowed:
+        return True, res.reason
+    return False, ""
+class ProxyPool:
+    def __init__(self, proxies: list[str]):
+        self._initial = [p for p in (proxies or []) if p]
+        self._proxies = list(self._initial)
+        self._failures: dict[str, int] = {}
+        self._idx = 0
+    def __len__(self) -> int:
+        return len(self._proxies)
+    @property
+    def total_configured(self) -> int:
+        return len(self._initial)
+    def get_next(self) -> str | None:
+        if not self._proxies:
+            return None
+        p = self._proxies[self._idx % len(self._proxies)]
+        self._idx += 1
+        return p
+    def ban(self, proxy: str | None) -> None:
+        if not proxy:
+            return
+        self._failures[proxy] = self._failures.get(proxy, 0) + 1
+        threshold = 2
+        if self._failures[proxy] >= threshold:
+            try:
+                if proxy in self._proxies:
+                    self._proxies.remove(proxy)
+                    if self._proxies:
+                        self._idx %= len(self._proxies)
+                    else:
+                        self._idx = 0
+                    logger.warning(f"Прокси временно исключён из пула ({self._failures[proxy]} ошибок): {_mask_proxy(proxy)}")
+            except ValueError:
+                pass
+class GiftCodePool:
+    def __init__(self, codes: list[str], per_account: int = 1):
+        self._codes = [c for c in (codes or []) if c]
+        self._per = max(1, per_account)
+        self._idx = 0
+    def __len__(self) -> int:
+        return max(0, len(self._codes) - self._idx)
+    @property
+    def codes(self) -> list[str]:
+        return self._codes[self._idx:]
+    def take(self) -> list[str]:
+        if self._idx >= len(self._codes):
+            return []
+        batch = self._codes[self._idx:self._idx + self._per]
+        self._idx += self._per
+        return batch
+async def _poll_store_page(steam, login: str, ready) -> dict | None:
+    page = None
+    for _ in range(max(1, REGION_WAIT_TRIES)):
+        await asyncio.sleep(REGION_WAIT_INTERVAL)
+        try:
+            html = await _net(steam.request, URL_ADDFUNDS, label=login)
+        except Exception as e:
+            logger.warning(f"[{login}] страница addfunds недоступна при опросе: {e}")
+            continue
+        page = parse_store_page(html)
+        if ready(page):
+            return page
+    return page
+async def _finish_with_gifts(
+    login: str, new_region: str | None, strategy, session_id, proxy_pool: "ProxyPool",
+    gift_pool: "GiftCodePool | None", password: str, shared_secret: str | None,
+    guard_provider: GuardProvider | None,
+) -> AccountRegionResult:
+    gift_results: list[tuple[str, bool, str]] = []
+    if gift_pool is not None:
+        codes = gift_pool.take()
+        if codes:
+            logger.info(f"[{login}] регион OK → активирую {len(codes)} гифт-код(ов)")
+            gift_results = await _activate_gifts_inline(
+                strategy, session_id, proxy_pool,
+                login, password, shared_secret, codes,
+                guard_provider=guard_provider,
+            )
+    return AccountRegionResult(login, RegionResult.OK, new_region=new_region, gift_results=gift_results)
+def extract_steam_country(html_or_json: str) -> str | None:
+    if not html_or_json:
+        return None
+    s = str(html_or_json).strip()
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            d = json.loads(s)
+            c = d.get("rgCountryCode") or d.get("country") or d.get("country_code")
+            if c and len(str(c)) == 2:
+                return str(c).upper()
+        except Exception:
+            pass
+    m = re.search(r'data-userinfo="([^"]+)"', s)
+    if m:
+        try:
+            raw = html.unescape(m.group(1))
+            d = json.loads(raw)
+            c = d.get("country_code") or d.get("country") or d.get("rgCountryCode")
+            if c and len(str(c)) == 2:
+                return str(c).upper()
+        except Exception:
+            pass
+    s_clean = html.unescape(s)
+    patterns = [
+        r'["\']country_code["\']\s*:\s*["\']([A-Za-z]{2})["\']',
+        r'g_strCountryCode\s*=\s*["\']([A-Za-z]{2})["\']',
+        r'rgCountryCode\s*=\s*["\']([A-Za-z]{2})["\']',
+        r'["\']rgCountryCode["\']\s*:\s*["\']([A-Za-z]{2})["\']',
+        r'["\']country["\']\s*:\s*["\']([A-Za-z]{2})["\']',
+        r'data-country=["\']([A-Za-z]{2})["\']',
+    ]
+    for p in patterns:
+        m2 = re.search(p, s_clean, re.IGNORECASE)
+        if m2:
+            return m2.group(1).upper()
+    return None
+
+async def _fetch_steam_page_country(steam, base_url: str, login: str) -> str | None:
+    cache_bust = f"_src_verify={int(time.time())}_{secrets.token_hex(4)}"
+    sep = "&" if "?" in base_url else "?"
+    url = f"{base_url}{sep}{cache_bust}"
+    headers = {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    try:
+        if hasattr(steam, "request") and callable(steam.request):
+            raw = await _net(steam.request, url, label=login, headers=headers)
+        elif hasattr(steam, "text") and callable(steam.text):
+            raw = await _net(steam.text, url, label=login, headers=headers)
+        elif hasattr(steam, "get") and callable(steam.get):
+            raw = await _net(steam.get, url, label=login, headers=headers)
+        else:
+            return None
+
+        if hasattr(raw, "text"):
+            page_text = await raw.text() if asyncio.iscoroutinefunction(raw.text) else raw.text()
+        else:
+            page_text = str(raw)
+
+        return extract_steam_country(page_text)
+    except Exception as e:
+        logger.debug(f"[{login}] verify_page error {base_url}: {e}")
+        return None
+
+async def verify_region_change(steam, login: str, target_cc: str) -> tuple[bool, dict[str, Any]]:
+    target = (target_cc or "").upper()
+    _log_event("region_verify_start", login=login, target=target)
+    check_results = []
+    for check_num in (1, 2):
+        await asyncio.sleep(1.5)
+        account_cc = await _fetch_steam_page_country(steam, URL_ACCOUNT, login)
+        addfunds_cc = await _fetch_steam_page_country(steam, URL_ADDFUNDS, login)
+        userdata_cc = await _fetch_steam_page_country(steam, "https://store.steampowered.com/dynamicstore/userdata/", login)
+
+        is_ok = bool(account_cc and account_cc == target and addfunds_cc and addfunds_cc == target)
+        if userdata_cc and userdata_cc != target:
+            is_ok = False
+
+        check_info = {
+            "check": check_num,
+            "account": account_cc,
+            "addfunds": addfunds_cc,
+            "userdata": userdata_cc,
+            "match": is_ok,
+        }
+        check_results.append(check_info)
+
+        _log_event(
+            "region_verify_check",
+            check=check_num,
+            account=account_cc,
+            addfunds=addfunds_cc,
+            status="ok" if is_ok else "fail",
+            login=login,
+            target=target,
+            userdata=userdata_cc,
+        )
+
+        if not is_ok:
+            _log_event(
+                "region_verify_failed",
+                login=login,
+                target=target,
+                reason="mismatch",
+                check=check_num,
+                account=account_cc,
+                addfunds=addfunds_cc,
+                userdata=userdata_cc,
+            )
+            return False, {"target": target, "checks": check_results, "reason": f"check_{check_num}_mismatch"}
+
+    _log_event(
+        "region_verify_success",
+        login=login,
+        target=target,
+        account=check_results[1]["account"],
+        addfunds=check_results[1]["addfunds"],
+        userdata=check_results[1]["userdata"],
+    )
+    return True, {"target": target, "checks": check_results}
+
+async def _region_change_core(
+    steam, strategy, session_id, login: str, country_code: str,
+    max_setcountry_attempts: int = 1,
+) -> AccountRegionResult | None:
+    target_cc = (country_code or "").upper()
+    eligibility = await check_account_eligibility(steam, login=login)
+    if not eligibility.allowed:
+        if eligibility.reason == FailureReason.ACCOUNT_PURCHASED:
+            err = "На аккаунте обнаружены покупки Steam. Смена региона невозможна."
+            st = RegionResult.SKIP_FIXED
+        elif eligibility.reason == FailureReason.ACCOUNT_FUNDED:
+            err = "На аккаунте обнаружено пополнение Steam Wallet. Смена региона невозможна."
+            st = RegionResult.SKIP_FIXED
+        elif eligibility.reason == FailureReason.ACCOUNT_KEY_ACTIVATED:
+            err = "На аккаунте обнаружена активация цифрового ключа Steam. Смена региона невозможна."
+            st = RegionResult.SKIP_FIXED
+        elif eligibility.reason == FailureReason.REGION_FIXED:
+            err = "Кошелёк аккаунта уже зафиксирован на другом регионе. Смена региона невозможна."
+            st = RegionResult.SKIP_FIXED
+        elif eligibility.reason == FailureReason.CHECK_FAILED:
+            err = "Не удалось получить необходимые страницы Steam для проверки аккаунта."
+            st = RegionResult.ERROR
+        else:
+            err = "Временная ошибка проверки пригодности аккаунта в Steam."
+            st = RegionResult.ERROR
+        logger.warning(f"[{login}] Проверка пригодности аккаунта не пройдена: {eligibility.reason} ({err})")
+        return AccountRegionResult(
+            login, st, error=err, failure_reason=eligibility.reason,
+        )
+    try:
+        html = await _net(steam.request, URL_ADDFUNDS, label=login)
+        page_before = parse_store_page(html)
+    except Exception as e:
+        logger.warning(f"[{login}] страница до смены недоступна: {e}")
+        page_before = {"country_code": None, "wallet_fixed": False}
+    current = page_before.get("country_code")
+    fixed = page_before.get("wallet_fixed")
+
+    if fixed and current and current.upper() != target_cc:
+        return AccountRegionResult(
+            login, RegionResult.SKIP_FIXED, new_region=current,
+            error=f"Кошелёк аккаунта уже зафиксирован на регионе {current or 'другом'} (были пополнения). Смена региона невозможна.",
+            failure_reason=FailureReason.REGION_FIXED,
+        )
+
+    if current and current.upper() == target_cc:
+        logger.info(f"[{login}] Страница addfunds уже показывает {target_cc}, выполняем финальную проверку...")
+        already_verified, _ = await verify_region_change(steam, login, target_cc)
+        if already_verified:
+            logger.info(f"[{login}] Регион {target_cc} уже надёжно установлен и подтверждён")
+            return AccountRegionResult(login, RegionResult.OK, new_region=target_cc)
+        logger.info(f"[{login}] Регион {target_cc} не подтверждён на account/, продолжаем процедуру смены...")
+
+    last_verify_error = ""
+    attempts_limit = max(1, max_setcountry_attempts)
+    for attempt in range(1, attempts_limit + 1):
+        logger.info(f"[{login}] Выполняем setcountry для целевого региона {target_cc} (попытка {attempt}/{attempts_limit})...")
+        set_ok = await _net(set_country_raw, strategy, target_cc, session_id, label=login)
+        if not set_ok:
+            logger.warning(f"[{login}] Запрос setcountry завершился ошибкой (не 2xx) на попытке {attempt}/{attempts_limit}")
+            if attempt < attempts_limit:
+                await asyncio.sleep(2.0)
+                continue
+            return AccountRegionResult(
+                login, RegionResult.FAIL_CHANGE,
+                error=f"Steam отклонил запрос setcountry (HTTP статус ошибки) для региона {target_cc}",
+                failure_reason=FailureReason.STEAM_TEMP_ERROR,
+            )
+
+        wallet_resp = await _net(trigger_wallet_raw, strategy, session_id, label=login)
+        logger.info(f"[{login}] fake redeem probe ответ Steam: {wallet_resp!r}")
+
+        verified, v_info = await verify_region_change(steam, login, target_cc)
+        if verified:
+            logger.info(f"[{login}] Регион Steam успешно изменён на {target_cc} и подтверждён проверкой (попытка {attempt}/{attempts_limit})")
+            return AccountRegionResult(login, RegionResult.OK, new_region=target_cc)
+
+        last_verify_error = v_info.get("reason", "mismatch")
+        logger.warning(f"[{login}] Проверка региона {target_cc} не подтвердилась на попытке {attempt}/{attempts_limit}: {last_verify_error}")
+        if attempt < attempts_limit:
+            await asyncio.sleep(2.0)
+
+    err_msg = (
+        f"Steam не применил смену региона на {target_cc}: "
+        f"проверка страниц account/ и addfunds не подтвердила целевой регион после {attempts_limit} попыток"
+    )
+    logger.warning(f"[{login}] {err_msg}")
+    return AccountRegionResult(
+        login, RegionResult.FAIL_VERIFY_REGION, error=err_msg,
+        failure_reason=FailureReason.VERIFY_FAILED,
+    )
+async def process_one_account(
+    login: str,
+    password: str,
+    shared_secret: str | None,
+    proxy_pool: "ProxyPool",
+    country_code: str,
+    semaphore: asyncio.Semaphore,
+    gift_pool: "GiftCodePool | None" = None,
+    guard_provider: GuardProvider | None = None,
+    max_attempts_override: int | None = None,
+    cancel_event: asyncio.Event | None = None,
+) -> AccountRegionResult:
+    async with semaphore:
+        if cancel_event is not None and cancel_event.is_set():
+            return AccountRegionResult(login, RegionResult.SKIPPED, error="отменено пользователем")
+        manual_mode = guard_provider is not None
+        if manual_mode:
+            Steam = await _try_import_manual_steam()
+        else:
+            Steam = await _try_import_pysteamauth()
+        if Steam is None:
+            return AccountRegionResult(
+                login=login,
+                status=RegionResult.ERROR,
+                error="pysteamauth не установлен. pip install pysteamauth",
+            )
+        if max_attempts_override is not None:
+            max_attempts = max(1, max_attempts_override)
+        else:
+            proxy_count = max(1, proxy_pool.total_configured)
+            max_attempts = min(REGION_MAX_TOTAL_ATTEMPTS, max(2, proxy_count * REGION_ATTEMPTS_PER_PROXY))
+        last_status = RegionResult.FAIL_CHANGE
+        last_error: str | None = None
+        guard_rejections = 0
+        guard_reject_limit = 3
+        reuse_proxy_on_guard = False
+        proxy = None
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            if attempt > 1:
+                if last_status == RegionResult.FAIL_RATE_LIMIT:
+                    rl_delay = RATE_LIMIT_DELAY
+                    try:
+                        rl_delay = int(_load_config().get("rate_limit_delay", RATE_LIMIT_DELAY))
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"[{login}] rate-limit Steam — пауза {rl_delay}с "
+                        f"(попытка {attempt}/{max_attempts})"
+                    )
+                    await asyncio.sleep(rl_delay)
+                elif reuse_proxy_on_guard and proxy:
+                    logger.info(f"[{login}] повторная попытка ввода Guard на том же прокси (попытка {attempt}/{max_attempts})")
+                else:
+                    logger.info(f"[{login}] следующий прокси (попытка {attempt}/{max_attempts})")
+            if not (reuse_proxy_on_guard and proxy):
+                proxy = proxy_pool.get_next()
+            reuse_proxy_on_guard = False
+            if proxy is None:
+                _log_event("account_proxy_exhausted", level=logging.WARNING, login=login, reason="pool_empty")
+                last_status, last_error = RegionResult.FAIL_SESSION, "Все прокси недоступны (исключены из пула)"
+                break
+            masked_px = _mask_proxy(proxy)
+            _log_event("account_attempt", login=login, attempt=attempt, max=max_attempts, proxy=masked_px)
+            strategy = ProxyRequestStrategy(proxy)
+            try:
+                if manual_mode:
+                    steam = Steam(login=login, password=password, request_strategy=strategy)
+                    steam.set_guard_provider(guard_provider)
+                else:
+                    steam = Steam(
+                        login=login,
+                        password=password,
+                        shared_secret=shared_secret,
+                        request_strategy=strategy,
+                    )
+                try:
+                    await _net(steam.login_to_steam, label=login)
+                except GuardCodeSkipped:
+                    return AccountRegionResult(login, RegionResult.SKIPPED, error="пропущено пользователем")
+                except GuardCodeRejected as e:
+                    guard_rejections += 1
+                    last_status, last_error = RegionResult.FAIL_WRONG_GUARD, str(e)
+                    _log_event("account_guard_rejected", level=logging.WARNING, login=login, count=guard_rejections, limit=guard_reject_limit)
+                    if guard_rejections >= guard_reject_limit:
+                        return AccountRegionResult(
+                            login, RegionResult.FAIL_WRONG_GUARD,
+                            error="Неверный/просроченный Guard-код (исчерпаны попытки ввода)",
+                            failure_reason=FailureReason.WRONG_GUARD,
+                        )
+                    reuse_proxy_on_guard = True
+                    continue
+                except Exception as e:
+                    msg = str(e)
+                    if "shared_secret is not specified" in msg:
+                        return AccountRegionResult(login, RegionResult.FAIL_NO_MAFILE, error=msg)
+                    if isinstance(e, SteamLoginFailed) and "неверный логин или пароль" in msg.lower():
+                        return AccountRegionResult(login, RegionResult.FAIL_WRONG_PASS, error="Неверный логин или пароль Steam", failure_reason=FailureReason.WRONG_CREDENTIALS)
+                    m = re.search(r"'code':\s*(\d+)", msg)
+                    code_num = int(m.group(1)) if m else None
+                    if getattr(e, "error_code", None) is not None:
+                        try:
+                            code_num = int(getattr(e, "error_code"))
+                        except (ValueError, TypeError):
+                            pass
+                    if code_num == 5 or "InvalidPassword" in msg or getattr(e, "error_code", None) == 5:
+                        return AccountRegionResult(login, RegionResult.FAIL_WRONG_PASS, error="Неверный логин или пароль Steam", failure_reason=FailureReason.WRONG_CREDENTIALS)
+                    if code_num in (65, 88) or getattr(e, "error_code", None) in (65, 88):
+                        guard_rejections += 1
+                        last_status, last_error = RegionResult.FAIL_WRONG_GUARD, "Неверный Guard-код"
+                        _log_event("account_guard_rejected", level=logging.WARNING, login=login, count=guard_rejections, limit=guard_reject_limit)
+                        if guard_rejections >= guard_reject_limit:
+                            return AccountRegionResult(
+                                login, RegionResult.FAIL_WRONG_GUARD,
+                                error="Неверный/просроченный Guard-код (исчерпаны попытки ввода)",
+                                failure_reason=FailureReason.WRONG_GUARD,
+                            )
+                        reuse_proxy_on_guard = True
+                        continue
+                    status = getattr(e, "status", None)
+                    err_low = msg.lower()
+                    if status == 429 or code_num == 84 or getattr(e, "error_code", None) == 84 or any(kw in err_low for kw in ("429", "ratelimit", "rate limit")):
+                        last_status, last_error = RegionResult.FAIL_RATE_LIMIT, msg
+                        _log_event("account_rate_limit", level=logging.WARNING, login=login, code=84, attempt=attempt)
+                        await asyncio.sleep(3.0)
+                        continue
+                    if (status in (500, 502, 503, 504)) or any(kw in err_low for kw in ("500", "502", "503", "504", "temporary unavailable", "server disconnected", "service unavailable")):
+                        last_status, last_error = RegionResult.FAIL_TEMP_ERROR, msg
+                        _log_event("steam_temp_error", level=logging.WARNING, login=login, err=msg[:80])
+                        await asyncio.sleep(3.0)
+                        continue
+                    if code_num in (15, 16):
+                        proxy_pool.ban(proxy)
+                        _log_event("account_proxy_error", level=logging.WARNING, login=login, proxy=masked_px, err=f"Steam AccessDenied (code {code_num})")
+                        last_status, last_error = RegionResult.FAIL_SESSION, msg
+                        continue
+                    if _is_proxy_timeout(e):
+                        proxy_pool.ban(proxy)
+                        _log_event("proxy_timeout", level=logging.WARNING, login=login, proxy=masked_px, attempt=attempt, err=msg[:80], reason=FailureReason.PROXY_TIMEOUT)
+                        last_status, last_error = RegionResult.FAIL_SESSION, msg
+                        await asyncio.sleep(2.0)
+                        continue
+                    if _is_network_error(e):
+                        proxy_pool.ban(proxy)
+                        _log_event("account_proxy_error", level=logging.WARNING, login=login, proxy=masked_px, err=msg[:80])
+                        last_status, last_error = RegionResult.FAIL_SESSION, msg
+                        await asyncio.sleep(2.0)
+                        continue
+                    _log_event("account_steam_error", level=logging.WARNING, login=login, err=msg[:80])
+                    await asyncio.sleep(1.0)
+                    last_status, last_error = RegionResult.FAIL_SESSION, msg
+                    continue
+                if not await steam.is_authorized():
+                    _log_event("account_not_authorized", level=logging.WARNING, login=login, attempt=attempt)
+                    last_status = RegionResult.FAIL_SESSION
+                    await asyncio.sleep(1.0)
+                    continue
+                try:
+                    session_id = await _net(steam.sessionid, "store.steampowered.com", label=login)
+                except Exception:
+                    try:
+                        session_id = await _net(steam.sessionid, "steamcommunity.com", label=login)
+                    except Exception as e:
+                        proxy_pool.ban(proxy)
+                        _log_event("account_session_error", level=logging.WARNING, login=login, proxy=masked_px, err=str(e)[:80])
+                        await asyncio.sleep(2.0)
+                        continue
+                result = await _region_change_core(steam, strategy, session_id, login, country_code, max_setcountry_attempts=1)
+                if result is None:
+                    continue
+                if result.status in (RegionResult.OK, RegionResult.ALREADY):
+                    return await _finish_with_gifts(
+                        login, result.new_region, strategy, session_id, proxy_pool,
+                        gift_pool, password, shared_secret, guard_provider,
+                    )
+                if result.status in (RegionResult.FAIL_CHANGE, RegionResult.FAIL_VERIFY_REGION):
+                    last_status = result.status
+                    last_error = result.error
+                    _log_event("account_region_attempt_failed", level=logging.WARNING, login=login, status=result.status, error=result.error)
+                    continue
+                return result
+            except Exception as e:
+                last_error = str(e)
+                status = getattr(e, "status", None)
+                code_num = getattr(e, "error_code", None)
+                err_low = str(e).lower()
+                if status == 429 or code_num == 84 or any(kw in err_low for kw in ("429", "ratelimit", "rate limit")):
+                    last_status, last_error = RegionResult.FAIL_RATE_LIMIT, str(e)
+                    _log_event("account_rate_limit", level=logging.WARNING, login=login, code=84, attempt=attempt)
+                    await asyncio.sleep(3.0)
+                    continue
+                elif (status in (500, 502, 503, 504)) or any(kw in err_low for kw in ("500", "502", "503", "504", "temporary unavailable", "server disconnected", "service unavailable")):
+                    last_status, last_error = RegionResult.FAIL_TEMP_ERROR, str(e)
+                    _log_event("steam_temp_error", level=logging.WARNING, login=login, err=str(e)[:80])
+                    await asyncio.sleep(3.0)
+                    continue
+                elif _is_proxy_timeout(e):
+                    proxy_pool.ban(proxy)
+                    _log_event("proxy_timeout", level=logging.WARNING, login=login, proxy=masked_px, attempt=attempt, err=str(e)[:80], reason=FailureReason.PROXY_TIMEOUT)
+                    last_status = RegionResult.FAIL_SESSION
+                    await asyncio.sleep(2.0)
+                elif _is_network_error(e):
+                    proxy_pool.ban(proxy)
+                    _log_event("account_net_error", level=logging.WARNING, login=login, proxy=masked_px, err=str(e)[:80])
+                    last_status = RegionResult.FAIL_SESSION
+                    await asyncio.sleep(2.0)
+                else:
+                    _log_event("account_error", level=logging.WARNING, login=login, err=str(e)[:80])
+                    last_status = RegionResult.FAIL_SESSION
+                    await asyncio.sleep(1.0)
+                continue
+            finally:
+                await strategy.close()
+        _log_event("account_change_failed", level=logging.WARNING, login=login, attempts=max_attempts, status=str(last_status))
+        fail_rsn = None
+        if proxy_pool is not None and len(proxy_pool) == 0:
+            fail_rsn = FailureReason.PROXY_EXHAUSTED
+        elif last_status == RegionResult.FAIL_RATE_LIMIT:
+            fail_rsn = FailureReason.STEAM_RATE_LIMIT
+        elif last_status == RegionResult.FAIL_TEMP_ERROR:
+            fail_rsn = FailureReason.STEAM_TEMP_ERROR
+        elif last_status == RegionResult.FAIL_VERIFY_REGION:
+            fail_rsn = FailureReason.VERIFY_FAILED
+        elif last_status == RegionResult.FAIL_WRONG_GUARD:
+            fail_rsn = FailureReason.WRONG_GUARD
+        elif last_status == RegionResult.FAIL_WRONG_PASS:
+            fail_rsn = FailureReason.WRONG_CREDENTIALS
+        return AccountRegionResult(
+            login, last_status,
+            error=last_error or f"Не удалось сменить регион после {max_attempts} попыток",
+            failure_reason=fail_rsn,
+        )
+async def process_one_account_qr(
+    proxy_pool: "ProxyPool",
+    country_code: str,
+    display_cb: QRDisplay,
+    gift_pool: "GiftCodePool | None" = None,
+    poll_timeout: float = 180.0,
+    begin_retries: int = 5,
+    confirmed_cb: Optional[Callable[[str], Awaitable[None]]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    order_id: str = "",
+) -> AccountRegionResult:
+    QRSteam = await _try_import_qr_steam()
+    if QRSteam is None:
+        return AccountRegionResult(order_id or "(qr)", RegionResult.ERROR,
+                                   error="pysteamauth/QR недоступен. pip install pysteamauth")
+    strategy = None
+    steam = None
+    account = None
+    last_err: str | None = None
+    tries = min(begin_retries, max(2, max(1, proxy_pool.total_configured) * 2))
+    for _ in range(tries):
+        if cancel_event and cancel_event.is_set():
+            return AccountRegionResult(order_id or "(qr)", RegionResult.SKIPPED, error="QR отменён")
+        proxy = proxy_pool.get_next()
+        if proxy is None:
+            return AccountRegionResult(order_id or "(qr)", RegionResult.FAIL_SESSION,
+                                       error=last_err or "Все прокси недоступны (исключены из пула)",
+                                       failure_reason=FailureReason.PROXY_EXHAUSTED)
+        strategy = ProxyRequestStrategy(proxy)
+        steam = QRSteam(login="qr_session", password="", request_strategy=strategy)
+        try:
+            account = await steam.login_via_qr(
+                display_cb,
+                poll_timeout=poll_timeout,
+                confirmed_cb=confirmed_cb,
+                cancel_event=cancel_event,
+                order_id=order_id,
+            )
+            if cancel_event and cancel_event.is_set():
+                await strategy.close()
+                return AccountRegionResult(order_id or "(qr)", RegionResult.SKIPPED, error="QR отменён")
+            break
+        except asyncio.CancelledError:
+            await strategy.close()
+            raise
+        except QRLoginCancelled as e:
+            await strategy.close()
+            return AccountRegionResult(order_id or "(qr)", RegionResult.SKIPPED, error=str(e), failure_reason=FailureReason.QR_TIMEOUT)
+        except QRLoginTimeout as e:
+            await strategy.close()
+            return AccountRegionResult(order_id or "(qr)", RegionResult.SKIPPED, error=str(e), failure_reason=FailureReason.QR_TIMEOUT)
+        except Exception as e:
+            last_err = str(e)
+            if strategy:
+                await strategy.close()
+                strategy = None
+            err_code = getattr(e, "error_code", None)
+            status = getattr(e, "status", None)
+            err_str = str(e).lower()
+            if (
+                err_code in (9, 42, 2, 16)
+                or "filenotfound" in err_str
+                or "code': 9" in err_str
+                or "code': 42" in err_str
+                or "code': 2" in err_str
+            ):
+                return AccountRegionResult(order_id or "(qr)", RegionResult.SKIPPED, error="QR-код не подтверждён (истекло время действия кода)", failure_reason=FailureReason.QR_TIMEOUT)
+
+            if status == 429 or err_code == 84 or any(kw in err_str for kw in ("429", "ratelimit", "rate limit")):
+                _log_event("qr_rate_limit", level=logging.WARNING, order_id=order_id, err=str(e)[:80])
+                return AccountRegionResult(order_id or "(qr)", RegionResult.FAIL_RATE_LIMIT, error=str(e), failure_reason=FailureReason.STEAM_RATE_LIMIT)
+
+            if (status in (500, 502, 503, 504)) or any(kw in err_str for kw in ("500", "502", "503", "504", "temporary unavailable", "server disconnected", "service unavailable")):
+                _log_event("qr_steam_temp_error", level=logging.WARNING, order_id=order_id, err=str(e)[:80])
+                return AccountRegionResult(order_id or "(qr)", RegionResult.FAIL_TEMP_ERROR, error=str(e), failure_reason=FailureReason.STEAM_TEMP_ERROR)
+
+            if _is_proxy_timeout(e):
+                proxy_pool.ban(proxy)
+                _log_event("proxy_timeout", level=logging.WARNING, order_id=order_id, proxy=_mask_proxy(proxy), err=str(e)[:80], reason=FailureReason.PROXY_TIMEOUT)
+                await asyncio.sleep(2.0)
+                continue
+
+            if _is_network_error(e):
+                proxy_pool.ban(proxy)
+                logger.warning(f"[QR] ошибка прокси при начале сессии: {str(e)[:80]}")
+                await asyncio.sleep(2.0)
+                continue
+
+            return AccountRegionResult(order_id or "(qr)", RegionResult.ERROR, error=str(e))
+    if cancel_event and cancel_event.is_set():
+        if strategy:
+            await strategy.close()
+        return AccountRegionResult(order_id or "(qr)", RegionResult.SKIPPED, error="QR отменён")
+    if strategy is None:
+        return AccountRegionResult(order_id or "(qr)", RegionResult.FAIL_SESSION,
+                                   error=last_err or "нет рабочего прокси для QR",
+                                   failure_reason=FailureReason.PROXY_EXHAUSTED)
+    login = account or order_id or "(qr)"
+    try:
+        if cancel_event and cancel_event.is_set():
+            return AccountRegionResult(login, RegionResult.SKIPPED, error="QR отменён")
+        if not await steam.is_authorized():
+            return AccountRegionResult(login, RegionResult.FAIL_SESSION, error="сессия не авторизована")
+        try:
+            session_id = await _net(steam.sessionid, "store.steampowered.com", label=login)
+        except Exception:
+            session_id = await _net(steam.sessionid, "steamcommunity.com", label=login)
+        result = await _region_change_core(steam, strategy, session_id, login, country_code, max_setcountry_attempts=2)
+        if result is None:
+            return AccountRegionResult(login, RegionResult.FAIL_CHANGE,
+                                       error="регион не применился — повторите вход по QR")
+        if result.status in (RegionResult.OK, RegionResult.ALREADY):
+            return await _finish_with_gifts(
+                login, result.new_region, strategy, session_id, proxy_pool,
+                gift_pool, password="", shared_secret=None, guard_provider=None,
+            )
+        return result
+    except Exception as e:
+        logger.warning(f"[{login}] ошибка смены региона после QR-входа: {e}")
+        status = getattr(e, "status", None)
+        err_str = str(e).lower()
+        if status == 429 or any(kw in err_str for kw in ("429", "ratelimit", "rate limit")):
+            return AccountRegionResult(login, RegionResult.FAIL_RATE_LIMIT, error=str(e), failure_reason=FailureReason.STEAM_RATE_LIMIT)
+        if (status in (500, 502, 503, 504)) or any(kw in err_str for kw in ("500", "502", "503", "504", "temporary unavailable", "server disconnected", "service unavailable")):
+            return AccountRegionResult(login, RegionResult.FAIL_TEMP_ERROR, error=str(e), failure_reason=FailureReason.STEAM_TEMP_ERROR)
+        return AccountRegionResult(login, RegionResult.ERROR, error=str(e))
+    finally:
+        await strategy.close()
+def _gift_log(login: str, code: str, ok: bool, msg: str) -> None:
+    logger.log(
+        logging.INFO if ok else logging.WARNING,
+        f"[{login}] gift redeem {_mask_gift_code(code)}: {'OK' if ok else 'FAIL'} — {msg}",
+    )
+async def _redeem_code_on_session(strategy, session_id, login: str, code: str) -> tuple[bool, str, bool]:
+    try:
+        resp = await strategy.request(
+            URL_REDEEM_GIFT, method="POST",
+            data=aiohttp.FormData(fields=[
+                ("wallet_code", code.strip()),
+                ("sessionid", session_id),
+            ]),
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://store.steampowered.com",
+                "Referer": "https://store.steampowered.com/account/",
+            },
+        )
+    except Exception as e:
+        msg = f"redeem error: {str(e)[:80]}"
+        _gift_log(login, code, False, msg)
+        return False, msg, _is_network_error(e)
+    if resp.status in _RETRYABLE_HTTP:
+        msg = f"HTTP {resp.status}"
+        _gift_log(login, code, False, msg)
+        return False, msg, True
+    try:
+        data = await resp.json(content_type=None)
+        success = (data.get("success") == 1)
+        detail = data.get("detail", "")
+        if success:
+            _gift_log(login, code, True, "OK")
+            return True, "OK", False
+        hint = _REDEEM_DETAIL.get(detail)
+        msg = f"detail={detail}: {hint}" if hint else (str(detail) or "Ошибка активации")
+        _gift_log(login, code, False, msg)
+        return False, msg, False
+    except Exception:
+        text = await resp.text()
+        _gift_log(login, code, False, text[:80])
+        return False, text[:80], False
+async def _quick_login(proxy, login: str, password: str, shared_secret: str | None,
+                       guard_provider: GuardProvider | None = None):
+    strategy = ProxyRequestStrategy(proxy)
+    try:
+        if guard_provider is not None:
+            Steam = await _try_import_manual_steam()
+            if Steam is None:
+                await strategy.close()
+                return None
+            steam = Steam(login=login, password=password, request_strategy=strategy)
+            code = await guard_provider(login)
+            if not (code or "").strip():
+                await strategy.close()
+                return None
+            steam.set_guard_code(code)
+        else:
+            Steam = await _try_import_pysteamauth()
+            if Steam is None:
+                await strategy.close()
+                return None
+            steam = Steam(login=login, password=password,
+                          shared_secret=shared_secret, request_strategy=strategy)
+        await _net(steam.login_to_steam, label=login)
+        if not await steam.is_authorized():
+            await strategy.close()
+            return None
+        try:
+            session_id = await _net(steam.sessionid, "store.steampowered.com", label=login)
+        except Exception:
+            session_id = await _net(steam.sessionid, "steamcommunity.com", label=login)
+        return steam, strategy, session_id
+    except Exception as e:
+        logger.warning(f"[{login}] gift relogin failed: {str(e)[:80]}")
+        await strategy.close()
+        return None
+async def _activate_gifts_inline(
+    strategy, session_id, proxy_pool: "ProxyPool",
+    login: str, password: str, shared_secret: str | None, codes: list[str],
+    guard_provider: GuardProvider | None = None,
+) -> list[tuple[str, bool, str]]:
+    results: list[tuple[str, bool, str]] = []
+    cur_strategy, cur_sid = strategy, session_id
+    extra_strategy = None
+    try:
+        for code in codes:
+            ok, msg, net = await _redeem_code_on_session(cur_strategy, cur_sid, login, code)
+            attempt = 1
+            while (not ok) and net and attempt < GIFT_MAX_PROXY_ATTEMPTS:
+                attempt += 1
+                proxy = proxy_pool.get_next()
+                relog = await _quick_login(proxy, login, password, shared_secret,
+                                           guard_provider=guard_provider)
+                if relog is None:
+                    continue
+                if extra_strategy is not None:
+                    await extra_strategy.close()
+                _steam2, extra_strategy, cur_sid = relog
+                cur_strategy = extra_strategy
+                ok, msg, net = await _redeem_code_on_session(cur_strategy, cur_sid, login, code)
+            results.append((code, ok, msg))
+    finally:
+        if extra_strategy is not None:
+            await extra_strategy.close()
+    return results
+async def change_region_batch(
+    accounts: list[dict],
+    proxies: list[str],
+    country_code: str,
+    max_workers: int = 3,
+    progress_cb = None,
+    gift_pool: "GiftCodePool | None" = None,
+    guard_provider: GuardProvider | None = None,
+    max_attempts_override: int | None = None,
+    cancel_event: asyncio.Event | None = None,
+) -> BatchRegionResult:
+    manual_mode = guard_provider is not None
+    workers = 1 if manual_mode else max(1, max_workers)
+    semaphore = asyncio.Semaphore(workers)
+    batch = BatchRegionResult(country_code=country_code, total=len(accounts))
+    proxy_pool = ProxyPool(proxies)
+    async def _worker(acc: dict) -> AccountRegionResult:
+        return await process_one_account(
+            login = acc["login"],
+            password = acc["password"],
+            shared_secret = acc.get("shared_secret"),
+            proxy_pool = proxy_pool,
+            country_code = country_code,
+            semaphore = semaphore,
+            gift_pool = gift_pool,
+            guard_provider = guard_provider,
+            max_attempts_override = max_attempts_override,
+            cancel_event = cancel_event,
+        )
+    if manual_mode:
+        done = 0
+        try:
+            for acc in accounts:
+                if cancel_event is not None and cancel_event.is_set():
+                    batch.results.append(AccountRegionResult(
+                        acc["login"], RegionResult.SKIPPED, error="отменено пользователем"))
+                    done += 1
+                    if progress_cb:
+                        try:
+                            await progress_cb(done, len(accounts), batch.results[-1])
+                        except Exception:
+                            pass
+                    continue
+                result = await _worker(acc)
+                batch.results.append(result)
+                done += 1
+                logger.info(
+                    f"[{result.login}] итог: {result.status}"
+                    + (f" region={result.new_region}" if result.new_region else "")
+                    + (f" error={result.error}" if result.error else "")
+                )
+                if progress_cb:
+                    try:
+                        await progress_cb(done, len(accounts), result)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            logger.info("change_region_batch (manual) отменён — частичный результат")
+        return batch
+    tasks = [asyncio.ensure_future(_worker(acc)) for acc in accounts]
+    done = 0
+    try:
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            batch.results.append(result)
+            done += 1
+            logger.info(
+                f"[{result.login}] итог: {result.status}"
+                + (f" region={result.new_region}" if result.new_region else "")
+                + (f" error={result.error}" if result.error else "")
+            )
+            if progress_cb:
+                try:
+                    await progress_cb(done, len(accounts), result)
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        batch.results = [r for r in gathered if isinstance(r, AccountRegionResult)]
+        logger.info("change_region_batch отменён — частичный результат")
+    return batch
+def parse_proxies(text: str) -> list[str]:
+    proxies: list[str] = []
+    lines = (text or "").splitlines()
+    for raw_line in lines:
+        line = raw_line.strip().strip("'\"` \t")
+        if not line or line.startswith("#"):
+            continue
+
+        norm = normalize_proxy_url(line)
+        if norm:
+            if norm not in proxies:
+                proxies.append(norm)
+            continue
+
+        chunks = line.split()
+        if len(chunks) > 1:
+            for chunk in chunks:
+                chunk = chunk.strip().strip("'\"` \t,;")
+                if not chunk or chunk.startswith("#"):
+                    continue
+                cnorm = normalize_proxy_url(chunk)
+                if cnorm and cnorm not in proxies:
+                    proxies.append(cnorm)
+        else:
+
+            if "," in line:
+                for sub in line.split(","):
+                    sub = sub.strip().strip("'\"` \t")
+                    if not sub or sub.startswith("#"):
+                        continue
+                    snorm = normalize_proxy_url(sub)
+                    if snorm and snorm not in proxies:
+                        proxies.append(snorm)
+    logger.info(f"[{NAME}] Распознано {len(proxies)} прокси из входного текста")
+    return proxies
+def parse_gift_codes(text: str) -> list[str]:
+    codes = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        cleaned = re.sub(r"[^A-Za-z0-9\-]", "", line)
+        if len(cleaned) >= 15:
+            codes.append(cleaned.upper())
+    return codes
+def validate_gift_codes_format(codes: list[str]) -> tuple[list[str], list[str]]:
+    pattern = re.compile(r'^[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$|^[A-Z0-9]{15,20}$')
+    valid = [c for c in codes if pattern.match(c)]
+    invalid = [c for c in codes if not pattern.match(c)]
+    return valid, invalid
+cardinal_instance = None
+bot_instance = None
+admin_chat_id = None
+
+BASE_DIR = os.getcwd()
+STORAGE_DIR = os.path.join(BASE_DIR, "storage", "plugins", "src_plugin")
+CONFIG_FILE = os.path.join(STORAGE_DIR, "settings.json")
+PROXIES_FILE = os.path.join(STORAGE_DIR, "proxies.txt")
+GIFTS_FILE = os.path.join(STORAGE_DIR, "gift_codes.txt")
+MAFILES_DIR = os.path.join(STORAGE_DIR, "mafiles")
+STATS_FILE = os.path.join(STORAGE_DIR, "stats.json")
+
+_config_lock = threading.Lock()
+_waiting: dict[int, dict[str, Any]] = {}
+
+DEFAULT_BUYER_MESSAGES: dict[str, str] = {
+    "welcome_menu": (
+        "🎉 Оплата прошла успешно, спасибо за доверие!\n\n"
+        "Для быстрой и безопасной смены региона выберите способ авторизации:\n"
+        "1️⃣ По Логину и Паролю — напишите цифру 1\n"
+        "2️⃣ По QR-коду (без ввода данных) — напишите цифру 2\n\n"
+        "ℹ️ Если что-то пошло не так — напишите «заново» или «-», чтобы начать сначала."
+    ),
+    "welcome": (
+        "🔹 Шаг 1 из 2: Логин аккаунта\n\n"
+        "Пожалуйста, отправьте логин от вашего аккаунта Steam в этот чат:\n"
+        "(Или отправьте сразу «логин:пароль»)"
+    ),
+    "ask_password": (
+        "✅ Логин принят: {login}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔹 Шаг 2 из 2: Пароль аккаунта\n\n"
+        "Теперь отправьте пароль от вашего аккаунта Steam в этот чат:\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    ),
+    "qr_ready_prompt": (
+        "Вы выбрали авторизацию по QR-коду. 📷\n\n"
+        "⚠️ Напишите + в чат, когда будете готовы открыть мобильное приложение Steam (Steam Guard → Сканер) и отсканировать код."
+    ),
+    "welcome_qr": (
+        "🛑 Отсканируйте и подтвердите вход в мобильном приложении Steam 🛑\n\n"
+        "🟢 Вхожу с веб-браузера\n"
+        "🟢 Локация — {country_name}\n\n"
+        "🔗 Прямая ссылка для входа:\n{challenge_url}"
+    ),
+    "qr_timeout": (
+        "⏳ QR-код истёк. Напишите 2 (или +) для нового QR-кода или 1 для входа по логину.\n\n"
+        "ℹ️ Если что-то пошло не так — напишите «заново» или «-», чтобы начать сначала."
+    ),
+    "qr_confirmed": (
+        "✅ Вход по QR подтверждён!\n\n"
+        "⏳ Продолжаем вход в аккаунт и смену региона на {country_name}..."
+    ),
+    "data_received": (
+        "✅ Данные получены!\n\n"
+        "⏳ Начинаем авторизацию в Steam и смену региона на {country_name}...\n"
+        "Пожалуйста, оставайтесь на связи. При необходимости бот запросит код Steam Guard."
+    ),
+    "guard_request": (
+        "🔐 Требуется код Steam Guard!\n\n"
+        "{guard_destination}\n\n"
+        "Пожалуйста, отправьте 5-значный код сообщением в этот чат:"
+    ),
+    "guard_retry": (
+        "⚠️ Введённый проверочный код не подошёл или истёк срок его действия!\n"
+        "(Срок действия кода Steam составляет около 2 минут).\n\n"
+        "🔄 Запрошен новый код для входа в Steam.\n"
+        "{guard_destination}\n\n"
+        "Пожалуйста, отправьте новый 5-значный проверочный код сообщением в этот чат:"
+    ),
+    "guard_push": (
+        "📱 Требуется подтверждение входа в Steam!\n\n"
+        "1️⃣ Зайдите в мобильное приложение Steam и откройте раздел «Steam Guard».\n"
+        "2️⃣ Вам будет предложен выбор для подтверждения входа:\n"
+        "• Сначала выберите: «Браузер»\n"
+        "• Затем выберите гео-метку со страной: {country_name}\n\n"
+        "💬 Либо вы можете просто отправить 5-значный проверочный код Steam Guard из мобильного приложения в этот чат!"
+    ),
+    "guard_received": (
+        "✅ Код Steam Guard принят!\n\n"
+        "⏳ Продолжаем вход в аккаунт и смену региона на {country_name}..."
+    ),
+    "success": (
+        "🎉 Регион Steam успешно изменён!\n\n"
+        "• Новый регион: {country_name}\n"
+        "• Аккаунт: {login}\n\n"
+        "Спасибо за покупку! Пожалуйста, подтвердите выполнение заказа на FunPay и оставьте отзыв ⭐⭐⭐⭐⭐"
+    ),
+    "account_purchased_refund": (
+        "🛑 Смена региона невозможна!\n\n"
+        "На вашем Steam аккаунте обнаружены покупки игр или предметов (смена региона доступна только на чистых аккаунтах без предыдущих покупок).\n\n"
+        "💸 Мы оформили автоматический возврат средств за ваш заказ #{order_id}.\n"
+        "Деньги уже возвращены на ваш баланс FunPay."
+    ),
+    "account_purchased_no_refund": (
+        "🛑 Смена региона невозможна!\n\n"
+        "На вашем Steam аккаунте обнаружены покупки игр или предметов (смена региона доступна только на чистых аккаунтах без предыдущих покупок).\n\n"
+        "Пожалуйста, свяжитесь с продавцом в этом чате для урегулирования заказа."
+    ),
+    "fixed_wallet_refund": (
+        "🛑 Смена региона невозможна!\n\n"
+        "На вашем Steam аккаунте обнаружено пополнение баланса Steam Wallet (смена региона доступна только на чистых аккаунтах без пополнений).\n\n"
+        "💸 Мы оформили автоматический возврат средств за ваш заказ #{order_id}.\n"
+        "Деньги уже возвращены на ваш баланс FunPay."
+    ),
+    "fixed_wallet_no_refund": (
+        "🛑 Смена региона невозможна!\n\n"
+        "На вашем Steam аккаунте обнаружено пополнение баланса Steam Wallet (смена региона доступна только на чистых аккаунтах без пополнений).\n\n"
+        "Пожалуйста, свяжитесь с продавцом в этом чате для урегулирования заказа."
+    ),
+    "no_proxies_refund": (
+        "⚠️ Временная недоступность прокси\n\n"
+        "К сожалению, для целевого региона {country_name} временно закончились рабочие прокси в пуле.\n\n"
+        "💸 Оформлен автоматический возврат средств за ваш заказ #{order_id}.\n"
+        "Приносим извинения за неудобства!"
+    ),
+    "no_proxies_no_refund": (
+        "⚠️ Временная недоступность прокси\n\n"
+        "К сожалению, для целевого региона {country_name} временно закончились рабочие прокси в пуле.\n\n"
+        "Пожалуйста, ожидайте ответа продавца в этом чате."
+    ),
+    "error_refund": (
+        "❌ Не удалось сменить регион Steam ({reason})\n\n"
+        "💸 Мы оформили автоматический возврат средств за ваш заказ #{order_id}.\n"
+        "Деньги уже возвращены на ваш баланс FunPay."
+    ),
+    "error_no_refund": (
+        "❌ Не удалось сменить регион Steam ({reason})\n\n"
+        "Пожалуйста, ожидайте ответа продавца в этом чате."
+    ),
+    "key_activated_refund": (
+        "🛑 Смена региона невозможна!\n\n"
+        "На вашем Steam аккаунте обнаружена активация цифровых ключей/продуктов (смена региона доступна только без активированных ключей).\n\n"
+        "💸 Мы оформили автоматический возврат средств за ваш заказ #{order_id}.\n"
+        "Деньги уже возвращены на ваш баланс FunPay."
+    ),
+    "key_activated_no_refund": (
+        "🛑 Смена региона невозможна!\n\n"
+        "На вашем Steam аккаунте обнаружена активация цифровых ключей/продуктов (смена региона доступна только без активированных ключей).\n\n"
+        "Пожалуйста, свяжитесь с продавцом в этом чате для урегулирования заказа."
+    ),
+    "reminder_login": (
+        "👋 Здравствуйте, {buyer_username}!\n\n"
+        "Напоминаем: для выполнения заказа #{order_id} по смене региона Steam на {country_name} отправьте логин и пароль от аккаунта Steam в этот чат.\n\n"
+        "💬 Можно отправить сразу в формате: логин:пароль"
+    ),
+    "reminder_password": (
+        "🔑 Напоминание по заказу #{order_id}!\n\n"
+        "Мы всё ещё ожидаем пароль от вашего аккаунта Steam ({login}).\n"
+        "Пожалуйста, отправьте пароль в этот чат для продолжения смены региона на {country_name}."
+    ),
+    "reminder_guard": (
+        "🔐 Напоминание по заказу #{order_id}!\n\n"
+        "Для завершения авторизации в Steam ({login}) требуется проверочный код Steam Guard.\n"
+        "Пожалуйста, проверьте мобильное приложение Steam или почту и отправьте проверочный код в этот чат."
+    ),
+    "welcome_qr_choice": (
+        "🎉 Оплата прошла успешно, спасибо за доверие!\n\n"
+        "Для быстрой и безопасной смены региона выберите способ авторизации:\n"
+        "1️⃣ По Логину и Паролю — напишите цифру 1\n"
+        "2️⃣ По QR-коду (без ввода данных) — напишите цифру 2\n\n"
+        "ℹ️ Если что-то пошло не так — напишите «заново» или «-», чтобы начать сначала."
+    ),
+    "welcome_qr_only": (
+        "Вы выбрали авторизацию по QR-коду. 📷\n\n"
+        "⚠️ Напишите + в чат, когда будете готовы открыть мобильное приложение Steam (Steam Guard → Сканер) и отсканировать код."
+    ),
+}
+
+_LEGACY_BUYER_MESSAGE_DEFAULTS: dict[str, str] = {
+    "guard_push": (
+        "📱 Требуется подтверждение входа!\n\n"
+        "Пожалуйста, откройте мобильное приложение Steam на телефоне и подтвердите попытку входа (нажмите «Подтвердить» в уведомлении Steam Guard).\n\n"
+        "⏳ Бот ожидает подтверждения входа..."
+    ),
+    "reminder_login": (
+        "👋 Здравствуйте, {buyer_username}!\n\n"
+        "Напоминаем: для выполнения заказа #{order_id} по смене региона Steam на {country_name}, пожалуйста, выберите способ авторизации:\n"
+        "1 — по логину и паролю\n"
+        "2 — по QR-коду (или напишите «+» когда будете готовы)"
+    ),
+}
+
+BUYER_MESSAGE_LABELS: dict[str, str] = {
+    "welcome_menu": "🎉 Выбор способа входа (1 или 2)",
+    "welcome": "🔹 Шаг 1: Запрос логина (или по цифре 1)",
+    "ask_password": "🔑 Шаг 2: Запрос пароля",
+    "qr_ready_prompt": "📷 Готовность к QR (запрос +)",
+    "welcome_qr": "🛑 Инструкция к QR-коду (с фото)",
+    "qr_timeout": "⏳ Тайм-аут QR-кода",
+    "qr_confirmed": "✅ Вход по QR подтверждён",
+    "data_received": "⏳ Данные приняты (старт смены)",
+    "guard_request": "🔐 Запрос Steam Guard",
+    "guard_retry": "⚠️ Повторный запрос Guard",
+    "guard_push": "📱 Запрос подтверждения Push",
+    "guard_received": "✅ Код Guard принят",
+    "success": "🎉 Успешная смена региона",
+    "reminder_login": "🔔 Напоминание при молчании",
+    "reminder_password": "🔑 Напоминание пароля",
+    "reminder_guard": "🔐 Напоминание кода Guard",
+    "account_purchased_refund": "🛒 Были покупки (автовозврат)",
+    "account_purchased_no_refund": "🛒 Были покупки (без автовозврата)",
+    "fixed_wallet_refund": "🛑 Были пополнения (автовозврат)",
+    "fixed_wallet_no_refund": "🛑 Были пополнения (без автовозврата)",
+    "key_activated_refund": "🔑 Активирован ключ (автовозврат)",
+    "key_activated_no_refund": "🔑 Активирован ключ (без автовозврата)",
+    "no_proxies_refund": "⚠️ Закончились прокси (автовозврат)",
+    "no_proxies_no_refund": "⚠️ Закончились прокси (без автовозврата)",
+    "error_refund": "❌ Ошибка смены (автовозврат)",
+    "error_no_refund": "❌ Ошибка смены (без автовозврата)",
+}
+
+BUYER_MESSAGE_HINTS: dict[str, str] = {
+    "welcome_menu": "Переменные: <code>{buyer_username}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "welcome": "Переменные: <code>{buyer_username}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "qr_ready_prompt": "Переменные: <code>{buyer_username}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "welcome_qr_choice": "Переменные: <code>{buyer_username}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "welcome_qr_only": "Переменные: <code>{buyer_username}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "welcome_qr": "Переменные: <code>{country_name}</code>, <code>{order_id}</code>, <code>{challenge_url}</code>",
+    "qr_timeout": "Переменные: <code>{buyer_username}</code>, <code>{country_name}</code>, <code>{order_id}</code>, <code>{login}</code>",
+    "account_purchased_refund": "Переменные: <code>{order_id}</code>, <code>{login}</code>, <code>{buyer_username}</code>",
+    "account_purchased_no_refund": "Переменные: <code>{order_id}</code>, <code>{login}</code>, <code>{buyer_username}</code>",
+    "key_activated_refund": "Переменные: <code>{order_id}</code>, <code>{login}</code>, <code>{buyer_username}</code>",
+    "key_activated_no_refund": "Переменные: <code>{order_id}</code>, <code>{login}</code>, <code>{buyer_username}</code>",
+    "qr_confirmed": "Переменные: <code>{country_name}</code>, <code>{order_id}</code>, <code>{login}</code>",
+    "ask_password": "Переменные: <code>{login}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "data_received": "Переменные: <code>{login}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "guard_request": "Переменные: <code>{login}</code>, <code>{order_id}</code>, <code>{guard_destination}</code>",
+    "guard_retry": "Переменные: <code>{login}</code>, <code>{order_id}</code>, <code>{guard_destination}</code>",
+    "guard_push": "Переменные: <code>{login}</code>, <code>{order_id}</code>, <code>{country_name}</code>",
+    "guard_received": "Переменные: <code>{country_name}</code>, <code>{login}</code>, <code>{order_id}</code>",
+    "success": "Переменные: <code>{country_name}</code>, <code>{login}</code>, <code>{order_id}</code>",
+    "reminder_login": "Переменные: <code>{buyer_username}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "reminder_password": "Переменные: <code>{login}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "reminder_guard": "Переменные: <code>{login}</code>, <code>{country_name}</code>, <code>{order_id}</code>",
+    "fixed_wallet_refund": "Переменные: <code>{order_id}</code>, <code>{login}</code>",
+    "fixed_wallet_no_refund": "Переменные: <code>{order_id}</code>, <code>{login}</code>",
+    "no_proxies_refund": "Переменные: <code>{order_id}</code>, <code>{country_name}</code>",
+    "no_proxies_no_refund": "Переменные: <code>{order_id}</code>, <code>{country_name}</code>",
+    "error_refund": "Переменные: <code>{order_id}</code>, <code>{reason}</code>",
+    "error_no_refund": "Переменные: <code>{order_id}</code>, <code>{reason}</code>",
+}
+
+def _get_buyer_messages() -> dict[str, str]:
+    cfg = _load_config()
+    saved = cfg.get("buyer_messages")
+    merged = dict(DEFAULT_BUYER_MESSAGES)
+    if isinstance(saved, dict):
+        for k, v in saved.items():
+            if k in DEFAULT_BUYER_MESSAGES and v:
+                saved_value = str(v)
+                if saved_value == _LEGACY_BUYER_MESSAGE_DEFAULTS.get(k):
+                    continue
+                if "{guard_destination}" in DEFAULT_BUYER_MESSAGES[k] and "{guard_destination}" not in saved_value:
+                    continue
+                merged[k] = saved_value
+    return merged
+def _render_buyer_msg(key: str, **kwargs) -> str:
+    msgs = _get_buyer_messages()
+    tmpl = msgs.get(key, DEFAULT_BUYER_MESSAGES.get(key, ""))
+    defaults = {
+        "buyer_username": "покупатель",
+        "login": "аккаунт",
+        "country_name": "выбранную страну",
+        "order_id": "",
+        "reason": "ошибка смены региона",
+        "guard_destination": "На ваш мобильный Guard или почту отправлен проверочный код.",
+        "challenge_url": "",
+    }
+    merged_kwargs = {**defaults, **kwargs}
+    try:
+        return tmpl.format(**merged_kwargs)
+    except Exception:
+        res = tmpl
+        for k, v in merged_kwargs.items():
+            res = res.replace(f"{{{k}}}", str(v))
+        return res
+DEFAULT_REFUND_REASONS: dict[str, bool] = {
+    FailureReason.PROXY_EXHAUSTED: True,
+    FailureReason.ACCOUNT_FUNDED: True,
+    FailureReason.ACCOUNT_PURCHASED: True,
+    FailureReason.ACCOUNT_KEY_ACTIVATED: True,
+    FailureReason.REGION_FIXED: True,
+    FailureReason.WRONG_CREDENTIALS: False,
+    FailureReason.WRONG_GUARD: False,
+    FailureReason.STEAM_TEMP_ERROR: False,
+    FailureReason.STEAM_RATE_LIMIT: False,
+    FailureReason.QR_TIMEOUT: False,
+    FailureReason.USER_TIMEOUT: False,
+    FailureReason.VERIFY_FAILED: True,
+    FailureReason.CHECK_FAILED: False,
+    FailureReason.UNKNOWN: False,
+}
+
+REFUND_REASON_LABELS: dict[str, str] = {
+    FailureReason.PROXY_EXHAUSTED: "Все прокси исчерпаны / недоступны",
+    FailureReason.ACCOUNT_FUNDED: "На аккаунте есть пополнения Steam Wallet",
+    FailureReason.ACCOUNT_PURCHASED: "На аккаунте были покупки Steam",
+    FailureReason.ACCOUNT_KEY_ACTIVATED: "На аккаунте активированы Steam-ключи",
+    FailureReason.REGION_FIXED: "Кошелёк/регион уже закреплён",
+    FailureReason.WRONG_CREDENTIALS: "Неверный логин или пароль",
+    FailureReason.WRONG_GUARD: "Неверный Guard-код",
+    FailureReason.STEAM_TEMP_ERROR: "Временная ошибка Steam (5xx)",
+    FailureReason.STEAM_RATE_LIMIT: "Превышен лимит запросов Steam (Rate Limit)",
+    FailureReason.QR_TIMEOUT: "Таймаут входа по QR-коду",
+    FailureReason.USER_TIMEOUT: "Покупатель не отвечает",
+    FailureReason.VERIFY_FAILED: "Смена региона не подтверждена",
+    FailureReason.CHECK_FAILED: "Сбой проверки пригодности аккаунта",
+    FailureReason.UNKNOWN: "Неизвестная ошибка",
+}
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "plugin_enabled": True,
+    "qr_login_mode": "choice",
+    "login_by_qr": True,
+    "auto_refund_enabled": True,
+    "refund_reasons": dict(DEFAULT_REFUND_REASONS),
+    "auto_deactivate_lots": True,
+    "check_steam_funding": True,
+    "buyer_inactivity_reminders": True,
+    "notify_tg_orders": True,
+    "notify_tg_success": True,
+    "notify_tg_errors": True,
+    "max_workers": 5,
+    "request_timeout": 30.0,
+    "connect_timeout": 15.0,
+    "auto_redeem_gift": True,
+    "rate_limit_delay": 30,
+    "lots": {},
+    "buyer_messages": dict(DEFAULT_BUYER_MESSAGES),
+}
+
+def should_refund(reason: str, order_id: str = "") -> bool:
+    if reason == FailureReason.PROXY_TIMEOUT:
+        return should_refund(FailureReason.PROXY_EXHAUSTED, order_id=order_id)
+    cfg = _load_config()
+    master_enabled = bool(cfg.get("auto_refund_enabled", True))
+    if not master_enabled:
+        _log_event("refund_skipped", order_id=order_id, reason=reason, enabled=False, master_disabled=True)
+        return False
+    refund_reasons = cfg.get("refund_reasons")
+    if not isinstance(refund_reasons, dict):
+        refund_reasons = DEFAULT_REFUND_REASONS
+    reason_enabled = bool(refund_reasons.get(reason, DEFAULT_REFUND_REASONS.get(reason, False)))
+    _log_event("refund_decision", order_id=order_id, reason=reason, enabled=reason_enabled)
+    if not reason_enabled:
+        _log_event("refund_skipped", order_id=order_id, reason=reason, enabled=False)
+    return reason_enabled
+
+def _get_qr_mode(cfg: dict[str, Any]) -> str:
+    m = cfg.get("qr_login_mode")
+    if m in ("choice", "qr_only", "off"):
+        return m
+    if cfg.get("login_by_qr") is False:
+        return "off"
+    return "choice"
+
+def _qr_mode_label(mode: str) -> str:
+    if mode == "choice":
+        return "🔄 QR или данные"
+    elif mode == "qr_only":
+        return "📱 Только QR-код"
+    else:
+        return "🔴 Только данные (логин/пароль)"
+
+def _get_lots_dict(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = cfg.get("lots")
+    res: dict[str, dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                res[str(k)] = {
+                    "id": str(v.get("id", k)),
+                    "title": str(v.get("title", f"Лот {k}")),
+                    "enabled": bool(v.get("enabled", True)),
+                    "country": str(v.get("country", "KZ")).upper(),
+                    "proxies": list(v.get("proxies") or []),
+                }
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                lid = str(item.get("id", ""))
+                if lid:
+                    res[lid] = {
+                        "id": lid,
+                        "title": str(item.get("title", f"Лот {lid}")),
+                        "enabled": bool(item.get("enabled", True)),
+                        "country": str(item.get("country", "KZ")).upper(),
+                        "proxies": list(item.get("proxies") or []),
+                    }
+            elif isinstance(item, (int, str)):
+                lid = str(item)
+                res[lid] = {
+                    "id": lid,
+                    "title": f"Лот {lid}",
+                    "enabled": True,
+                    "country": "KZ",
+                    "proxies": [],
+                }
+    return res
+DEFAULT_STATS: dict[str, Any] = {
+    "total_operations": 0,
+    "success": 0,
+    "failed": 0,
+    "gifts_redeemed": 0,
+    "last_operation": "нет данных",
+}
+
+def _init_storage():
+    os.makedirs(STORAGE_DIR, exist_ok=True)
+    os.makedirs(MAFILES_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+    if not os.path.exists(PROXIES_FILE):
+        with open(PROXIES_FILE, "w", encoding="utf-8") as f:
+            f.write("# Список прокси (каждый с новой строки):\n# ip:port\n# ip:port:user:pass\n# http://user:pass@ip:port\n")
+    if not os.path.exists(GIFTS_FILE):
+        with open(GIFTS_FILE, "w", encoding="utf-8") as f:
+            f.write("# Список Steam Wallet Gift-кодов (каждый с новой строки):\n# XXXXX-XXXXX-XXXXX\n")
+    if not os.path.exists(STATS_FILE):
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_STATS, f, indent=2, ensure_ascii=False)
+    _load_processed_orders()
+def _load_config() -> dict[str, Any]:
+    with _config_lock:
+        if not os.path.exists(CONFIG_FILE):
+            return dict(DEFAULT_CONFIG)
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = dict(DEFAULT_CONFIG)
+            if isinstance(data, dict):
+                cfg.update(data)
+            if "refund_reasons" not in cfg or not isinstance(cfg["refund_reasons"], dict):
+                cfg["refund_reasons"] = dict(DEFAULT_REFUND_REASONS)
+            else:
+                merged_reasons = dict(DEFAULT_REFUND_REASONS)
+                merged_reasons.update(cfg["refund_reasons"])
+                cfg["refund_reasons"] = merged_reasons
+            return cfg
+        except Exception as e:
+            logger.error(f"[{NAME}] Ошибка чтения {CONFIG_FILE}: {e}")
+            return dict(DEFAULT_CONFIG)
+def _save_config(cfg: dict[str, Any]) -> None:
+    with _config_lock:
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[{NAME}] Ошибка сохранения {CONFIG_FILE}: {e}")
+_stats_lock = threading.Lock()
+_gifts_lock = threading.Lock()
+_in_flight_gift_codes: set[str] = set()
+
+def _load_stats() -> dict[str, Any]:
+    with _stats_lock:
+        if not os.path.exists(STATS_FILE):
+            return dict(DEFAULT_STATS)
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            res = dict(DEFAULT_STATS)
+            if isinstance(data, dict):
+                res.update(data)
+            return res
+        except Exception as e:
+            logger.warning(f"[{NAME}] Ошибка чтения {STATS_FILE}: {e}")
+            return dict(DEFAULT_STATS)
+def _save_stats(st: dict[str, Any]) -> None:
+    with _stats_lock:
+        try:
+            with open(STATS_FILE, "w", encoding="utf-8") as f:
+                json.dump(st, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"[{NAME}] Ошибка сохранения {STATS_FILE}: {e}")
+def _load_proxies() -> list[str]:
+    if not os.path.exists(PROXIES_FILE):
+        return []
+    try:
+        with open(PROXIES_FILE, "r", encoding="utf-8") as f:
+            return parse_proxies(f.read())
+    except Exception as e:
+        logger.error(f"[{NAME}] Ошибка чтения {PROXIES_FILE}: {e}")
+        return []
+def _save_proxies(proxies: list[str]) -> None:
+    try:
+        with open(PROXIES_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(proxies) + ("\n" if proxies else ""))
+    except Exception as e:
+        logger.error(f"[{NAME}] Ошибка сохранения {PROXIES_FILE}: {e}")
+def _load_gift_codes() -> list[str]:
+    with _gifts_lock:
+        if not os.path.exists(GIFTS_FILE):
+            return []
+        try:
+            with open(GIFTS_FILE, "r", encoding="utf-8") as f:
+                return parse_gift_codes(f.read())
+        except Exception as e:
+            logger.error(f"[{NAME}] Ошибка чтения {GIFTS_FILE}: {e}")
+            return []
+def _save_gift_codes(codes: list[str]) -> None:
+    with _gifts_lock:
+        try:
+            with open(GIFTS_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(codes) + ("\n" if codes else ""))
+        except Exception as e:
+            logger.error(f"[{NAME}] Ошибка сохранения {GIFTS_FILE}: {e}")
+def _reserve_gift_code() -> str | None:
+    with _gifts_lock:
+        if not os.path.exists(GIFTS_FILE):
+            return None
+        try:
+            with open(GIFTS_FILE, "r", encoding="utf-8") as f:
+                all_codes = parse_gift_codes(f.read())
+        except Exception:
+            return None
+        for code in all_codes:
+            if code not in _in_flight_gift_codes:
+                _in_flight_gift_codes.add(code)
+                return code
+        return None
+def _commit_gift_code(code: str) -> None:
+    if not code:
+        return
+    with _gifts_lock:
+        _in_flight_gift_codes.discard(code)
+        try:
+            all_codes = []
+            if os.path.exists(GIFTS_FILE):
+                with open(GIFTS_FILE, "r", encoding="utf-8") as f:
+                    all_codes = parse_gift_codes(f.read())
+            remaining = [c for c in all_codes if c != code]
+            with open(GIFTS_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(remaining) + ("\n" if remaining else ""))
+        except Exception as e:
+            logger.error(f"[{NAME}] Ошибка списания гифт-кода {_mask_gift_code(code)}: {e}")
+def _release_gift_code(code: str) -> None:
+    if not code:
+        return
+    with _gifts_lock:
+        _in_flight_gift_codes.discard(code)
+def _list_mafiles() -> list[str]:
+    if not os.path.exists(MAFILES_DIR):
+        return []
+    try:
+        return [f for f in os.listdir(MAFILES_DIR) if f.endswith(".maFile")]
+    except Exception:
+        return []
+def _country_display(code: str) -> str:
+    code = (code or "").upper()
+    return COUNTRY_NAMES.get(code, f"🌐 {code}")
+def _is_authorized(user_id) -> bool:
+    if user_id is None:
+        return False
+    try:
+        auth = getattr(getattr(cardinal_instance, 'telegram', None), 'authorized_users', None)
+        if isinstance(auth, dict) and auth:
+            return user_id in auth or int(user_id) in auth or str(user_id) in auth
+    except Exception as e:
+        logger.warning(f"[{NAME}] Ошибка проверки авторизации TG: {e}")
+    return False
+def _tg_send(chat_id, text: str, reply_markup=None) -> None:
+    if not bot_instance or not chat_id:
+        return
+    try:
+        bot_instance.send_message(int(chat_id), text, parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"[{NAME}] TG send error: {e}")
+def _tg_edit(chat_id, message_id, text: str, reply_markup=None) -> None:
+    if not bot_instance or not chat_id or not message_id:
+        return
+    try:
+        bot_instance.edit_message_text(text, int(chat_id), int(message_id), parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=True)
+    except Exception:
+        _tg_send(chat_id, text, reply_markup)
+def _notify_tg(text: str, ntype: str = "order") -> None:
+    cfg = _load_config()
+    if ntype == "order" and not cfg.get("notify_tg_orders", True):
+        return
+    if ntype == "success" and not cfg.get("notify_tg_success", True):
+        return
+    if ntype == "error" and not cfg.get("notify_tg_errors", True):
+        return
+    targets = []
+    if cardinal_instance and getattr(cardinal_instance, 'telegram', None):
+        auth = getattr(cardinal_instance.telegram, 'authorized_users', None)
+        if isinstance(auth, dict) and auth:
+            targets = list(auth.keys())
+    if not targets and admin_chat_id:
+        targets = [admin_chat_id]
+    if not targets or not bot_instance:
+        return
+    for cid in targets:
+        try:
+            _tg_send(cid, text)
+        except Exception as e:
+            logger.debug(f"[{NAME}] TG notification failed: {e}")
+def _make_kb(rows: list[list[tuple[str, str]]]):
+    if not tg_types:
+        return None
+    kb = tg_types.InlineKeyboardMarkup()
+    for row in rows:
+        kb.row(*[tg_types.InlineKeyboardButton(text, callback_data=data) for text, data in row])
+    return kb
+def _mask_secret(val: str, prefix_len=3, suffix_len=3) -> str:
+    if len(val) <= prefix_len + suffix_len:
+        return "***"
+    return f"{val[:prefix_len]}...{val[-suffix_len:]}"
+def _about_text():
+    return (
+        f"🧩 <b>Плагин:</b> {NAME}\n"
+        f"📦 <b>Версия:</b> {VERSION}\n"
+        f"👤 <b>Автор:</b> <a href=\"{CREATOR_URL}\">{CREDITS}</a>\n\n"
+        "Выберите раздел ниже."
+    )
+def _home_kb():
+    return _make_kb([
+        [("⚙️ Настройки", "src_settings_panel"), ("ℹ️ Информация", "src_info")],
+        [("⬆️ Обновить плагин", "src_update_menu"), ("🗑 Удалить", "src_delete_ask")],
+        [("🔙 К списку плагинов", CB_PLUGINS_LIST_OPEN)],
+    ])
+def _open_home(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    _tg_edit(chat_id, message_id, _about_text(), _home_kb()) if message_id else _tg_send(chat_id, _about_text(), _home_kb())
+def _info_text():
+    return (
+        "ℹ️ <b>Информация</b>\n\n"
+        f"Здесь находятся официальные ссылки {NAME}.\n\n"
+        "• <b>Чат</b> - помощь и общение.\n"
+        "• <b>Канал</b> - новости и обновления.\n"
+        "• <b>Инструкция</b> - настройка и использование плагина.\n"
+        "• <b>Мой Telegram</b> - связь с автором."
+    )
+def _info_kb():
+    if not tg_types:
+        return None
+    kb = tg_types.InlineKeyboardMarkup()
+    kb.row(tg_types.InlineKeyboardButton("💬 Чат", url=GROUP_URL), tg_types.InlineKeyboardButton("📢 Канал", url=CHANNEL_URL))
+    kb.row(tg_types.InlineKeyboardButton("📖 Инструкция", url=INSTRUCTION_URL))
+    kb.row(tg_types.InlineKeyboardButton("📚 Альтернативная инструкция", url=ALT_INSTRUCTION_URL))
+    kb.row(tg_types.InlineKeyboardButton("👤 Мой Telegram", url=CREATOR_URL))
+    kb.add(tg_types.InlineKeyboardButton("◀️ Назад", callback_data="src_home"))
+    return kb
+def _open_info(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    _tg_edit(chat_id, message_id, _info_text(), _info_kb()) if message_id else _tg_send(chat_id, _info_text(), _info_kb())
+def _update_menu_text():
+    return (
+        f"⬆️ <b>Обновление {NAME}</b>\n\n"
+        f"Текущая версия: {VERSION}\n\n"
+        "• <b>Обновить локально</b> — пришлите новый файл плагина <code>.py</code> в этот чат. Он будет проверен и установлен вместо текущего файла.\n"
+        "• <b>Обновить онлайн</b> — проверить новую версию и скачать её с GitHub.\n\n"
+        "Перед заменой автоматически создаётся резервная копия текущего плагина и настроек."
+    )
+def _update_menu_kb():
+    return _make_kb([
+        [("📥 Обновить локально", "src_update_local")],
+        [("🌐 Обновить онлайн", "src_update_online")],
+        [("◀️ Назад", "src_home")],
+    ])
+def _open_update_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    _tg_edit(chat_id, message_id, _update_menu_text(), _update_menu_kb()) if message_id else _tg_send(chat_id, _update_menu_text(), _update_menu_kb())
+def _delete_confirm_text():
+    return (
+        "⚠️ <b>Удаление плагина</b>\n\n"
+        f"Вы точно хотите удалить <b>{NAME}</b>?\n\n"
+        "Будут удалены:\n"
+        "• файлы плагина\n"
+        "• настройки и логи\n\n"
+        "<b>Действие необратимо.</b>\n"
+        "После удаления выполните перезапуск: напишите команду <code>/restart</code>."
+    )
+def _delete_confirm_kb():
+    return _make_kb([
+        [("✅ Да, удалить", "src_delete_yes"), ("❌ Нет", "src_home")],
+    ])
+def _open_delete_confirm(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    _tg_edit(chat_id, message_id, _delete_confirm_text(), _delete_confirm_kb()) if message_id else _tg_send(chat_id, _delete_confirm_text(), _delete_confirm_kb())
+def _settings_panel_text(chat_id):
+    cfg = _load_config()
+    plugin_state = "🟢 Включено" if cfg.get("plugin_enabled", True) else "🔴 Выключено"
+    lots = _get_lots_dict(cfg)
+    total_lots = len(lots)
+    active_lots = sum(1 for l in lots.values() if l.get("enabled", False))
+    proxies = _load_proxies()
+    gifts = _load_gift_codes()
+    return (
+        "⚙️ <b>Панель настроек</b>\n\n"
+        f"• Плагин: <b>{plugin_state}</b>\n"
+        f"• Лоты: <b>🟢 Активных: {active_lots} / Всего: {total_lots} шт.</b>\n"
+        f"• База: <code>{len(proxies)}</code> прокси / <code>{len(gifts)}</code> гифтов\n\n"
+        "Выберите раздел:"
+    )
+def _settings_panel_kb(chat_id):
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    rows = [
+        [("⚙️ Настройки плагина", "src_mini_settings")],
+        [(f"⭐ Настройка лотов · {len(lots)}", "src_lots_menu")],
+        [("📊 Статистика", "src_stats")],
+        [("◀️ Назад", "src_home")],
+    ]
+    return _make_kb(rows)
+def _open_settings_panel(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _settings_panel_text(chat_id)
+    kb = _settings_panel_kb(chat_id)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _mini_settings_text(chat_id):
+    cfg = _load_config()
+    enabled = cfg.get("plugin_enabled", True)
+    auto_refund = cfg.get("auto_refund_enabled", True)
+    auto_deact = cfg.get("auto_deactivate_lots", True)
+    notif_orders = cfg.get("notify_tg_orders", True)
+    redeem = cfg.get("auto_redeem_gift", True)
+    workers = cfg.get("max_workers", 5)
+    timeout = cfg.get("request_timeout", 30.0)
+    gifts = _load_gift_codes()
+    lots = _get_lots_dict(cfg)
+    return (
+        f"⚙️ <b>Настройки плагина</b>\n\n"
+        f"• Состояние: <b>{'🟢 включён' if enabled else '🔴 выключен'}</b>\n"
+        f"• Автовозврат: <b>{'🟢 ВКЛ' if auto_refund else '🔴 ВЫКЛ'}</b>\n"
+        f"• Автодеактивация лотов: <b>{'🟢 ВКЛ' if auto_deact else '🔴 ВЫКЛ'}</b>\n"
+        f"• Уведомления Telegram: <b>{'🟢 ВКЛ' if notif_orders else '🔴 ВЫКЛ'}</b>\n"
+        f"• Одновременных замен: <b>{workers}</b>\n"
+        f"• Таймаут запросов: <b>{int(timeout)} сек</b>\n"
+        f"• Активация гифтов: <b>{'🟢 ВКЛ' if redeem else '🔴 ВЫКЛ'}</b>\n"
+        f"• База гифтов: <b>{len(gifts)} шт.</b>\n"
+        f"• Привязано лотов: <b>{len(lots)} шт.</b>\n\n"
+        "Выберите категорию:"
+    )
+def _mini_settings_kb(chat_id):
+    cfg = _load_config()
+    enabled = cfg.get("plugin_enabled", True)
+    rows = [
+        [(f"🧩 Состояние плагина: {'🟢 ВКЛ' if enabled else '🔴 ВЫКЛ'}", "src_tgl_state")],
+        [("🛒 Заказы", "src_cat_orders")],
+        [("🔔 Уведомления", "src_cat_notif")],
+        [("📦 Очередь и лимиты", "src_cat_queue")],
+        [("🎁 Управление гифтами", "src_gifts")],
+        [("🧰 Обслуживание", "src_cat_maint")],
+        [("◀️ Назад", "src_settings_panel")],
+    ]
+    return _make_kb(rows)
+def _open_mini_settings(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _mini_settings_text(chat_id)
+    kb = _mini_settings_kb(chat_id)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _refunds_menu_text():
+    cfg = _load_config()
+    auto_refund = cfg.get("auto_refund_enabled", True)
+    reasons = cfg.get("refund_reasons") or DEFAULT_REFUND_REASONS
+    text = (
+        "💸 <b>Настройки автовозвратов</b>\n\n"
+        f"• Общий переключатель: <b>{'🟢 ВКЛ' if auto_refund else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Если выключен — возврат средств не производится ни по одной причине)</i>\n\n"
+        "<b>Правила возврата по отдельным причинам:</b>\n"
+    )
+    for code, label in REFUND_REASON_LABELS.items():
+        val = reasons.get(code, DEFAULT_REFUND_REASONS.get(code, False))
+        text += f"• {'✅' if val else '❌'} {label}\n"
+    text += "\nНажмите на причину для переключения:"
+    return text
+def _refunds_menu_kb():
+    cfg = _load_config()
+    auto_refund = cfg.get("auto_refund_enabled", True)
+    reasons = cfg.get("refund_reasons") or DEFAULT_REFUND_REASONS
+    rows = [
+        [(f"💸 Автовозврат (общий): {'🟢 ВКЛ' if auto_refund else '🔴 ВЫКЛ'}", "src_tgl_refund_master")],
+    ]
+    for code, label in REFUND_REASON_LABELS.items():
+        val = reasons.get(code, DEFAULT_REFUND_REASONS.get(code, False))
+        mark = "✅" if val else "❌"
+        rows.append([(f"{mark} {label}", f"src_tgl_ref_reason:{code}")])
+    rows.append([("◀️ Назад", "src_cat_orders")])
+    return _make_kb(rows)
+def _open_refunds_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _refunds_menu_text()
+    kb = _refunds_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _notif_menu_text():
+    cfg = _load_config()
+    n_ord = cfg.get("notify_tg_orders", True)
+    n_suc = cfg.get("notify_tg_success", True)
+    n_err = cfg.get("notify_tg_errors", True)
+    return (
+        "🔔 <b>Настройки уведомлений в Telegram</b>\n\n"
+        "Настройте события, о которых плагин присылает уведомления вам в Telegram:\n\n"
+        f"• Новые заказы: <b>{'🟢 ВКЛ' if n_ord else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Оповещение при получении нового заказа и запросе данных у покупателя)</i>\n\n"
+        f"• Успешная смена: <b>{'🟢 ВКЛ' if n_suc else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Оповещение об успешной смене региона и активации гифт-карты)</i>\n\n"
+        f"• Ошибки и возвраты: <b>{'🟢 ВКЛ' if n_err else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Оповещение о неудачной смене, пополненном кошельке или автовозврате)</i>\n\n"
+        "Нажмите на кнопку для переключения:"
+    )
+def _notif_menu_kb():
+    cfg = _load_config()
+    n_ord = cfg.get("notify_tg_orders", True)
+    n_suc = cfg.get("notify_tg_success", True)
+    n_err = cfg.get("notify_tg_errors", True)
+    rows = [
+        [(f"🛒 Новые заказы: {'🟢 ВКЛ' if n_ord else '🔴 ВЫКЛ'}", "src_tgl_notif_orders")],
+        [(f"✅ Успешная смена: {'🟢 ВКЛ' if n_suc else '🔴 ВЫКЛ'}", "src_tgl_notif_success")],
+        [(f"⚠️ Ошибки и возвраты: {'🟢 ВКЛ' if n_err else '🔴 ВЫКЛ'}", "src_tgl_notif_errors")],
+        [("◀️ Назад", "src_mini_settings")],
+    ]
+    return _make_kb(rows)
+def _open_notif_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _notif_menu_text()
+    kb = _notif_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _orders_menu_text():
+    cfg = _load_config()
+    qr_mode = _get_qr_mode(cfg)
+    auto_refund = cfg.get("auto_refund_enabled", True)
+    auto_deact = cfg.get("auto_deactivate_lots", True)
+    check_fund = cfg.get("check_steam_funding", True)
+    remind_inact = cfg.get("buyer_inactivity_reminders", True)
+    return (
+        "🛒 <b>Настройки заказов</b>\n\n"
+        f"• Режим входа в заказах: <b>{_qr_mode_label(qr_mode)}</b>\n"
+        "  <i>(🔄 QR или данные — отправляет QR-код и предлагает ввод данных на выбор;\n"
+        "   📱 Только QR-код — вход покупателя только по сканированию QR;\n"
+        "   🔴 Только данные — классический запрос логина и пароля без QR)</i>\n\n"
+        f"• Автовозврат: <b>{'🟢 ВКЛ' if auto_refund else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Если у покупателя уже были пополнения Steam или смена невозможна — автоматический возврат средств)</i>\n\n"
+        f"• Напоминания при молчании: <b>{'🟢 ВКЛ' if remind_inact else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Если покупатель не отвечает — не делать автовозврат, а отправлять напоминание в чат FunPay)</i>\n\n"
+        f"• Защита от пополнений: <b>{'🟢 ВКЛ' if check_fund else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Проверка истории покупок и кошелька Steam перед сменой региона)</i>\n\n"
+        f"• Автодеактивация лотов: <b>{'🟢 ВКЛ' if auto_deact else '🔴 ВЫКЛ'}</b>\n"
+        "  <i>(Если у лота закончились рабочие прокси — лот автоматически деактивируется на FunPay)</i>\n\n"
+        "Выберите параметр для переключения:"
+    )
+def _orders_menu_kb():
+    cfg = _load_config()
+    qr_mode = _get_qr_mode(cfg)
+    auto_refund = cfg.get("auto_refund_enabled", True)
+    auto_deact = cfg.get("auto_deactivate_lots", True)
+    check_fund = cfg.get("check_steam_funding", True)
+    remind_inact = cfg.get("buyer_inactivity_reminders", True)
+    rows = [
+        [(f"📱 Режим входа: {_qr_mode_label(qr_mode)}", "src_cycle_qr_mode")],
+        [(f"💸 Автовозврат: {'🟢 ВКЛ' if auto_refund else '🔴 ВЫКЛ'}", "src_tgl_refund"), ("⚙️ Причины", "src_cat_refunds")],
+        [(f"🔔 Напоминания при молчании: {'🟢 ВКЛ' if remind_inact else '🔴 ВЫКЛ'}", "src_tgl_inact_remind")],
+        [(f"🛡 Защита от пополнений: {'🟢 ВКЛ' if check_fund else '🔴 ВЫКЛ'}", "src_tgl_funding")],
+        [(f"🛑 Автодеактивация лотов: {'🟢 ВКЛ' if auto_deact else '🔴 ВЫКЛ'}", "src_tgl_deact")],
+        [("💬 Шаблоны сообщений", "src_cat_messages")],
+        [("◀️ Назад", "src_mini_settings")],
+    ]
+    return _make_kb(rows)
+def _open_orders_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _orders_menu_text()
+    kb = _orders_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _messages_menu_text():
+    return (
+        "💬 <b>Шаблоны сообщений покупателям</b>\n\n"
+        "Здесь вы можете изменить тексты сообщений, которые плагин отправляет покупателям в чат FunPay при обработке заказа.\n\n"
+        "Выберите сообщение для настройки:"
+    )
+def _messages_menu_kb():
+    rows = []
+    for key, label in BUYER_MESSAGE_LABELS.items():
+        rows.append([(f"✏️ {label}", f"src_msg_view:{key}")])
+    rows.append([("🔄 Сбросить все шаблоны", "src_msg_reset_all")])
+    rows.append([("◀️ Назад", "src_cat_orders")])
+    return _make_kb(rows)
+def _open_messages_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _messages_menu_text()
+    kb = _messages_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _open_msg_editor(chat_id, key, message_id=None):
+    _waiting[chat_id] = {"action": "edit_buyer_message", "key": key, "prompt_id": message_id}
+    label = BUYER_MESSAGE_LABELS.get(key, key)
+    cur = _get_buyer_messages().get(key, "")
+    hint = BUYER_MESSAGE_HINTS.get(key, "")
+    safe_cur = html.escape(cur)
+    text = (
+        f"💬 <b>Редактирование сообщения</b>\n"
+        f"<b>Тип:</b> {label}\n\n"
+        f"<b>Текущий текст:</b>\n"
+        f"<pre>{safe_cur}</pre>\n\n"
+        f"💡 {hint}\n\n"
+        "Отправьте новый текст сообщением в чат или выберите действие ниже:"
+    )
+    kb = _make_kb([
+        [("🔄 Сбросить на стандартный", f"src_msg_reset_one:{key}")],
+        [("◀️ К списку сообщений", "src_cat_messages")],
+    ])
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _queue_menu_text():
+    cfg = _load_config()
+    workers = cfg.get("max_workers", 5)
+    timeout = cfg.get("request_timeout", 30.0)
+    delay = cfg.get("rate_limit_delay", 30)
+    return (
+        "📦 <b>Очередь и лимиты</b>\n\n"
+        f"• Одновременных замен аккаунтов: <b>{workers}</b>\n"
+        f"• Таймаут запросов к Steam: <b>{int(timeout)} сек</b>\n"
+        f"• Задержка при Steam rate-limit: <b>{delay} сек</b>\n\n"
+        "Здесь настраивается многопоточность для смены региона и сетевые таймауты запросов через прокси."
+    )
+def _queue_menu_kb():
+    cfg = _load_config()
+    workers = cfg.get("max_workers", 5)
+    timeout = cfg.get("request_timeout", 30.0)
+    rows = [
+        [(f"⚡️ Одновременных смен: {workers}", "src_cycle_workers")],
+        [(f"⏱ Таймаут запросов: {int(timeout)}с", "src_cycle_timeout")],
+        [("◀️ Назад", "src_mini_settings")],
+    ]
+    return _make_kb(rows)
+def _open_queue_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _queue_menu_text()
+    kb = _queue_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _gifts_menu_text():
+    cfg = _load_config()
+    redeem = cfg.get("auto_redeem_gift", True)
+    codes = _load_gift_codes()
+    preview = []
+    for i, c in enumerate(codes[:5], 1):
+        masked = f"{c[:4]}-*****-{c[-4:]}" if len(c) >= 12 else _mask_secret(c)
+        preview.append(f"{i}. <code>{masked}</code>")
+    preview_str = "\n".join(preview) if preview else "<i>(база пуста)</i>"
+    more = f"\n<i>... и ещё {len(codes) - 5} кодов</i>" if len(codes) > 5 else ""
+    return (
+        "🎁 <b>Управление гифтами Steam Wallet</b>\n\n"
+        f"• Активация гифта при смене: <b>{'🟢 ВКЛ' if redeem else '🔴 ВЫКЛ'}</b>\n"
+        f"• Всего кодов в базе: <b>{len(codes)} шт.</b>\n\n"
+        f"<b>Доступные коды:</b>\n{preview_str}{more}"
+    )
+def _gifts_menu_kb():
+    cfg = _load_config()
+    redeem = cfg.get("auto_redeem_gift", True)
+    codes = _load_gift_codes()
+    rows = [
+        [(f"🎁 Активация гифта: {'🟢 ВКЛ' if redeem else '🔴 ВЫКЛ'}", "src_tgl_redeem")],
+        [("➕ Добавить ключи (текст / .txt)", "src_input_gifts")],
+    ]
+    if codes:
+        rows.append([("🗑 Очистить базу гифтов", "src_clear_gifts_ask")])
+    rows.append([("◀️ Назад", "src_mini_settings")])
+    return _make_kb(rows)
+def _menu_gifts(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _gifts_menu_text()
+    kb = _gifts_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _proxies_menu_text():
+    proxies = _load_proxies()
+    preview = []
+    for i, p in enumerate(proxies[:5], 1):
+        clean_p = re.sub(r':([^@:]+)@', ':***@', p)
+        preview.append(f"{i}. <code>{clean_p}</code>")
+    preview_str = "\n".join(preview) if preview else "<i>(список пуст)</i>"
+    more = f"\n<i>... и ещё {len(proxies) - 5} прокси</i>" if len(proxies) > 5 else ""
+    return (
+        "🌐 <b>Управление общей базой прокси</b>\n\n"
+        f"• Всего прокси в пуле: <b>{len(proxies)} шт.</b>\n"
+        f"• Файл: <code>{PROXIES_FILE}</code>\n\n"
+        f"<b>Текущие прокси:</b>\n{preview_str}{more}\n\n"
+        "💡 Поддерживаются форматы (HTTP/HTTPS):\n"
+        "• <code>ip:port</code>\n"
+        "• <code>ip:port:user:pass</code>\n"
+        "• <code>http://user:pass@ip:port</code>"
+    )
+def _proxies_menu_kb():
+    rows = [
+        [("➕ Добавить прокси текстом", "src_input_proxies")],
+        [("🧪 Тестировать прокси", "src_test_proxies"), ("🗑 Очистить базу", "src_clear_proxies_ask")],
+        [("◀️ Назад", "src_mini_settings")],
+    ]
+    return _make_kb(rows)
+def _menu_proxies(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _proxies_menu_text()
+    kb = _proxies_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _maint_menu_text():
+    return (
+        "🧰 <b>Обслуживание плагина</b>\n\n"
+        "Здесь вы можете управлять конфигурацией плагина или скачать файлы логов:\n\n"
+        "• <b>Конфигурация</b> — резервное копирование и восстановление настроек (settings.json).\n"
+        "• <b>Скачать логи</b> — выгрузка лог-файлов Cardinal и плагина."
+    )
+def _maint_menu_kb():
+    rows = [
+        [("⚙️ Конфигурация", "src_maint_cfg_menu")],
+        [("📄 Скачать логи", "src_maint_download_logs")],
+        [("◀️ Назад", "src_mini_settings")],
+    ]
+    return _make_kb(rows)
+def _open_maint_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _maint_menu_text()
+    kb = _maint_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _maint_cfg_menu_text():
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    return (
+        "⚙️ <b>Управление конфигурацией</b>\n\n"
+        f"• Файл: <code>{CONFIG_FILE}</code>\n"
+        f"• Привязано лотов: <b>{len(lots)} шт.</b>\n\n"
+        "Выберите действие:"
+    )
+def _maint_cfg_menu_kb():
+    rows = [
+        [("💾 Скачать конфиг (.json)", "src_maint_export_cfg")],
+        [("📥 Импортировать конфиг (.json)", "src_maint_import_cfg")],
+        [("◀️ Назад", "src_cat_maint")],
+    ]
+    return _make_kb(rows)
+def _open_maint_cfg_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _maint_cfg_menu_text()
+    kb = _maint_cfg_menu_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+LOTS_PER_PAGE = 5
+
+def _open_lots_menu(chat_id, message_id=None, page: int = 0):
+    _waiting.pop(chat_id, None)
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    total_lots = len(lots)
+    active_lots = sum(1 for l in lots.values() if l.get("enabled", False))
+    text = (
+        f"⭐ <b>Настройка лотов {NAME}</b>\n\n"
+        f"• Всего лотов в плагине: <b>{total_lots} шт.</b>\n"
+        f"• Активных: <b>🟢 {active_lots}</b> | Выключенных: <b>🔴 {total_lots - active_lots}</b>"
+    )
+    rows: list[list[tuple[str, str]]] = [
+        [("🔄 Автодобавление (кат. 2044)", "src_lots_auto_2044"), ("➕ Добавить вручную", "src_lot_add_wizard")],
+        [("⚙️ Общая", "src_lots_bulk_menu")],
+    ]
+    lot_items = list(lots.values())
+    total_pages = max(1, (total_lots + LOTS_PER_PAGE - 1) // LOTS_PER_PAGE) if total_lots > 0 else 1
+    page = max(0, min(page, total_pages - 1))
+    start = page * LOTS_PER_PAGE
+    end = start + LOTS_PER_PAGE
+    page_lots = lot_items[start:end]
+    for l in page_lots:
+        lid = str(l["id"])
+        st_ico = "🟢" if l.get("enabled", False) else "🔴"
+        cc = l.get("country", "KZ")
+        px_cnt = len(l.get("proxies") or [])
+        lbl = f"{st_ico} #{lid} · {_country_display(cc)} ({px_cnt} px)"
+        rows.append([(lbl, f"src_lot_card:{lid}")])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(("◀️ Пред.", f"src_lots_page:{page - 1}"))
+        nav.append((f"Стр {page + 1}/{total_pages}", "src_lots_noop"))
+        if page < total_pages - 1:
+            nav.append(("След. ▶️", f"src_lots_page:{page + 1}"))
+        rows.append(nav)
+    rows.append([("◀️ Назад", "src_settings_panel")])
+    kb = _make_kb(rows)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+
+def _open_lots_bulk_menu(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    total_lots = len(lots)
+    active_lots = sum(1 for l in lots.values() if l.get("enabled", False))
+    inactive_lots = total_lots - active_lots
+
+    if total_lots == 0:
+        text = (
+            f"⚙️ <b>Общее управление лотами {NAME}</b>\n\n"
+            f"В плагине пока нет добавленных лотов."
+        )
+        rows: list[list[tuple[str, str]]] = [
+            [("◀️ Назад к лотам", "src_lots_menu")],
+        ]
+    else:
+        text = (
+            f"⚙️ <b>Общее управление лотами {NAME}</b>\n\n"
+            f"• Всего лотов в плагине: <b>{total_lots} шт.</b>\n"
+            f"• Активных: <b>🟢 {active_lots}</b> | Выключенных: <b>🔴 {inactive_lots}</b>\n\n"
+            f"Выберите необходимое действие:"
+        )
+        rows = []
+        if active_lots == 0:
+            rows.append([("🟢 Включить все лоты", "src_lots_bulk_toggle:enable")])
+        else:
+            rows.append([("🔴 Выключить все лоты", "src_lots_bulk_toggle:disable")])
+        rows.append([("🗑 Удалить все лоты", "src_lots_bulk_del_ask")])
+        rows.append([("◀️ Назад к лотам", "src_lots_menu")])
+
+    kb = _make_kb(rows)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _open_lot_card(chat_id, lot_id: str, message_id=None):
+    _waiting.pop(chat_id, None)
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    lot = lots.get(str(lot_id))
+    if not lot:
+        _tg_send(chat_id, f"⚠️ Лот #{lot_id} не найден.")
+        _open_lots_menu(chat_id, message_id)
+        return
+    title = lot.get("title", f"Лот {lot_id}")
+    enabled = lot.get("enabled", True)
+    country = lot.get("country", "KZ")
+    proxies = lot.get("proxies", [])
+    text = (
+        f"📦 <b>Настройки лота #{lot_id}</b>\n\n"
+        f"• Название: <i>{title}</i>\n"
+        f"• Состояние: <b>{'🟢 Включён' if enabled else '🔴 Выключен'}</b>\n"
+        f"• Целевая страна: <b>{_country_display(country)}</b> (<code>{country}</code>)\n"
+        f"• Привязано прокси: <b>{len(proxies)} шт.</b>"
+    )
+    rows = [
+        [(f"🧩 Состояние: {'🟢 ВКЛ' if enabled else '🔴 ВЫКЛ'}", f"src_lot_tgl:{lot_id}")],
+        [(f"🌍 Изменить страну ({country})", f"src_lot_change_cc:{lot_id}")],
+        [(f"🌐 Настройка прокси · {len(proxies)} шт.", f"src_lot_px_menu:{lot_id}")],
+        [("🗑 Удалить лот из плагина", f"src_lot_delete_ask:{lot_id}")],
+        [("◀️ К списку лотов", "src_lots_menu")],
+    ]
+    kb = _make_kb(rows)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _lot_proxies_menu_text(lot_id: str):
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    lot = lots.get(str(lot_id)) or {}
+    title = lot.get("title", f"Лот {lot_id}")
+    country = lot.get("country", "KZ")
+    proxies = lot.get("proxies", [])
+    preview = []
+    for i, p in enumerate(proxies[:5], 1):
+        clean_p = re.sub(r':([^@:]+)@', ':***@', p)
+        preview.append(f"{i}. <code>{clean_p}</code>")
+    px_preview = "\n".join(preview) if preview else "<i>(нет привязанных прокси — добавьте для работы смены региона!)</i>"
+    if len(proxies) > 5:
+        px_preview += f"\n<i>... и ещё {len(proxies) - 5} прокси</i>"
+    return (
+        f"🌐 <b>Настройка прокси лота #{lot_id}</b>\n\n"
+        f"• Лот: <i>{title}</i>\n"
+        f"• Страна: <b>{_country_display(country)}</b> (<code>{country}</code>)\n"
+        f"• Всего прокси: <b>{len(proxies)} шт.</b>\n\n"
+        f"<b>Текущие прокси:</b>\n{px_preview}\n\n"
+        "💡 <i>Вы можете добавить прокси текстом или файлом .txt, проверить их доступность или экспортировать.</i>"
+    )
+def _lot_proxies_menu_kb(lot_id: str):
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    proxies = (lots.get(str(lot_id)) or {}).get("proxies", [])
+    rows = [
+        [("➕ Добавить прокси (текст / .txt)", f"src_lot_add_px:{lot_id}")],
+    ]
+    if proxies:
+        rows.append([("🧪 Тестировать прокси", f"src_lot_test_px:{lot_id}"), ("🗑 Очистить прокси", f"src_lot_clear_px:{lot_id}")])
+    rows.append([("◀️ Назад к лоту", f"src_lot_card:{lot_id}")])
+    return _make_kb(rows)
+def _open_lot_proxies_menu(chat_id, lot_id: str, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _lot_proxies_menu_text(lot_id)
+    kb = _lot_proxies_menu_kb(lot_id)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _open_lot_change_cc(chat_id, lot_id: str, message_id=None):
+    _waiting.pop(chat_id, None)
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    lot = lots.get(str(lot_id)) or {}
+    cur_cc = lot.get("country", "KZ")
+    text = (
+        f"🌍 <b>Выбор страны для лота #{lot_id}</b>\n\n"
+        f"Текущая страна: <b>{_country_display(cur_cc)}</b> (<code>{cur_cc}</code>)\n\n"
+        "Выберите страну из списка или отправьте двухбуквенный код текстом:"
+    )
+    rows = [
+        [("🇰🇿 Казахстан", f"src_lot_set_cc:{lot_id}:KZ"), ("🇺🇸 США", f"src_lot_set_cc:{lot_id}:US")],
+        [("🇺🇦 Украина", f"src_lot_set_cc:{lot_id}:UA"), ("🇷🇺 Россия", f"src_lot_set_cc:{lot_id}:RU")],
+        [("🇹🇷 Турция", f"src_lot_set_cc:{lot_id}:TR"), ("🇦🇷 Аргентина", f"src_lot_set_cc:{lot_id}:AR")],
+        [("✍️ Ввести свой код", f"src_lot_input_cc:{lot_id}")],
+        [("◀️ Назад", f"src_lot_card:{lot_id}")],
+    ]
+    kb = _make_kb(rows)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _test_lot_proxies_worker(chat_id, lot_id: str, message_id=None):
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    lot = lots.get(str(lot_id)) or {}
+    proxies = lot.get("proxies", [])
+    if not proxies:
+        _tg_edit(chat_id, message_id, f"⚠️ У лота #{lot_id} нет привязанных прокси.", _make_kb([[("◀️ Назад", f"src_lot_px_menu:{lot_id}")]]))
+        return
+    _tg_edit(chat_id, message_id, f"⏳ <b>Тестирование {len(proxies)} прокси лота #{lot_id}...</b>\nПожалуйста, подождите.", _make_kb([[("◀️ Назад", f"src_lot_px_menu:{lot_id}")]]))
+    _log_event("lot_proxy_test_start", lot_id=lot_id, count=len(proxies))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    async def _test():
+        details = []
+        alive = 0
+        dead = 0
+        sem = asyncio.Semaphore(5)
+        async def _check(p):
+            nonlocal alive, dead
+            clean_p = _mask_proxy(p)
+            async with sem:
+                ok, diag = await check_proxy(p, timeout=8.0)
+                if ok:
+                    alive += 1
+                    details.append(f"🟢 <code>{clean_p}</code> → {diag} (Steam OK)")
+                    _log_event("lot_proxy_test", status="ok", lot_id=lot_id, proxy=clean_p, diag=diag)
+                else:
+                    dead += 1
+                    details.append(f"🔴 <code>{clean_p}</code> → {diag}")
+                    _log_event("lot_proxy_test", level=logging.WARNING, status="fail", lot_id=lot_id, proxy=clean_p, diag=diag)
+        await asyncio.gather(*[_check(p) for p in proxies])
+        return alive, dead, details
+    try:
+        alive, dead, details = loop.run_until_complete(_test())
+        _log_event("lot_proxy_summary", lot_id=lot_id, total=len(proxies), alive=alive, dead=dead)
+        det_str = "\n".join(details[:10])
+        if len(details) > 10:
+            det_str += f"\n<i>... и ещё {len(details) - 10} прокси</i>"
+        res_text = (
+            f"🧪 <b>Результаты тестирования прокси лота #{lot_id}:</b>\n\n"
+            f"• Всего проверено: <b>{len(proxies)}</b>\n"
+            f"• Живые (Steam доступен): <b>🟢 {alive}</b>\n"
+            f"• Недоступны / ошибки: <b>🔴 {dead}</b>\n\n"
+            f"<b>Статус по прокси:</b>\n{det_str}"
+        )
+    except Exception as e:
+        _log_event("lot_proxy_test_error", level=logging.ERROR, lot_id=lot_id, err=str(e))
+        res_text = f"❌ Ошибка проверки: {e}"
+    finally:
+        loop.close()
+    _tg_edit(chat_id, message_id, res_text, _make_kb([[("🔄 Проверить снова", f"src_lot_test_px:{lot_id}"), ("◀️ К прокси лота", f"src_lot_px_menu:{lot_id}")]]))
+def _handle_auto_lots_2044(chat_id, message_id=None):
+    if not cardinal_instance or not getattr(cardinal_instance, 'account', None):
+        _tg_edit(chat_id, message_id, "⚠️ Аккаунт FunPay в Cardinal не инициализирован. Убедитесь, что Cardinal запущен и авторизован в FunPay.", _make_kb([[("◀️ Назад", "src_lots_menu")]]))
+        return
+    _tg_edit(chat_id, message_id, "⏳ <b>Поиск ваших лотов в категории 2044...</b>", _make_kb([[("◀️ Назад", "src_lots_menu")]]))
+    def _worker():
+        try:
+            account = cardinal_instance.account
+            found_lots = []
+            try:
+                found_lots = account.get_my_subcategory_lots(2044)
+            except Exception as e:
+                logger.warning(f"[{NAME}] get_my_subcategory_lots(2044): {e}")
+            if not found_lots and getattr(account, 'id', None):
+                try:
+                    profile = account.get_user(int(account.id))
+                    if profile:
+                        for lot in profile.get_lots():
+                            sub = getattr(lot, 'subcategory', None)
+                            if sub and getattr(sub, 'id', None) == 2044:
+                                found_lots.append(lot)
+                except Exception as e:
+                    logger.warning(f"[{NAME}] get_user lots fallback: {e}")
+            if not found_lots:
+                _tg_edit(chat_id, message_id, "ℹ️ В категории 2044 не найдено ваших лотов. Создайте лот на FunPay или добавьте лот вручную по ID.", _make_kb([[("➕ Добавить вручную", "src_lot_add_wizard"), ("◀️ Назад", "src_lots_menu")]]))
+                return
+            cfg = _load_config()
+            lots = _get_lots_dict(cfg)
+            added_cnt = 0
+            already_cnt = 0
+            for l in found_lots:
+                lid = str(getattr(l, 'id', '') or '')
+                if not lid:
+                    continue
+                if lid in lots:
+                    already_cnt += 1
+                    continue
+                title = str(getattr(l, 'description', None) or getattr(l, 'title', None) or f"Лот {lid}")
+                t_low = title.lower()
+                cc = "KZ"
+                if any(k in t_low for k in ["казахстан", "тенге", " kz", "(kz)"]):
+                    cc = "KZ"
+                elif any(k in t_low for k in ["турци", "лир", " tr", "(tr)"]):
+                    cc = "TR"
+                elif any(k in t_low for k in ["украин", "гривн", " ua", "(ua)"]):
+                    cc = "UA"
+                elif any(k in t_low for k in ["росси", "рубл", " ru", "(ru)"]):
+                    cc = "RU"
+                elif any(k in t_low for k in ["сша", "доллар", " us", "(us)", "usa"]):
+                    cc = "US"
+                elif any(k in t_low for k in ["аргентин", "песо", " ar", "(ar)"]):
+                    cc = "AR"
+                lots[lid] = {
+                    "id": lid,
+                    "title": title,
+                    "enabled": False,
+                    "country": cc,
+                    "proxies": [],
+                }
+                added_cnt += 1
+            cfg["lots"] = lots
+            _save_config(cfg)
+            msg = (
+                f"✅ <b>Автодобавление лотов (кат. 2044) завершено!</b>\n\n"
+                f"• Найдено лотов: <b>{len(found_lots)} шт.</b>\n"
+                f"• Добавлено новых: <b>{added_cnt} шт.</b>\n"
+                f"• Уже было в плагине: <b>{already_cnt} шт.</b>"
+            )
+            _tg_edit(chat_id, message_id, msg, _make_kb([[("⭐ Открыть список лотов", "src_lots_menu")]]))
+        except Exception as e:
+            logger.error(f"[{NAME}] Ошибка автодобавления лотов: {e}", exc_info=True)
+            _tg_edit(chat_id, message_id, f"❌ Ошибка сканирования: {e}", _make_kb([[("◀️ Назад", "src_lots_menu")]]))
+    threading.Thread(target=_worker, daemon=True).start()
+def _start_lot_wizard(chat_id, message_id=None):
+    _waiting[chat_id] = {"action": "wiz_step1_id", "prompt_id": message_id}
+    text = (
+        "➕ <b>Добавление лота · Шаг 1 из 3</b>\n\n"
+        "Введите числовой ID лота FunPay (например: <code>12345678</code>):"
+    )
+    kb = _make_kb([[("❌ Отмена", "src_lots_menu")]])
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _lot_wizard_ask_country(chat_id, lot_id: str, title: str, message_id=None):
+    _waiting[chat_id] = {"action": "wiz_step2_country", "lot_id": lot_id, "title": title, "prompt_id": message_id}
+    text = (
+        f"🌍 <b>Добавление лота · Шаг 2 из 3</b>\n\n"
+        f"Лот: <code>{lot_id}</code>\n"
+        f"Название: <i>{title}</i>\n\n"
+        "Выберите целевую страну или отправьте её 2-буквенный код текстом (например: <code>RU</code>):"
+    )
+    rows = [
+        [("🇰🇿 Казахстан", "src_wiz_cc:KZ"), ("🇺🇸 США", "src_wiz_cc:US")],
+        [("🇺🇦 Украина", "src_wiz_cc:UA"), ("🇷🇺 Россия", "src_wiz_cc:RU")],
+        [("🇹🇷 Турция", "src_wiz_cc:TR"), ("🇦🇷 Аргентина", "src_wiz_cc:AR")],
+        [("❌ Отмена", "src_lots_menu")],
+    ]
+    kb = _make_kb(rows)
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _lot_wizard_ask_proxy(chat_id, lot_id: str, title: str, cc: str, message_id=None):
+    _waiting[chat_id] = {"action": "wiz_step3_proxy", "lot_id": lot_id, "title": title, "country": cc, "prompt_id": message_id}
+    text = (
+        f"🌐 <b>Добавление лота · Шаг 3 из 3</b>\n\n"
+        f"Лот: <code>{lot_id}</code> | Страна: <b>{_country_display(cc)}</b>\n\n"
+        f"Для работы лота необходим прокси под целевой регион.\n"
+        f"Отправьте прокси текстом (каждый с новой строки) или загрузите файл <code>.txt</code>:\n\n"
+        "<b>Поддерживаемые форматы (HTTP/HTTPS):</b>\n"
+        "• <code>ip:port</code>\n"
+        "• <code>ip:port:login:password</code>\n"
+        "• <code>http://ip:port</code>\n"
+        "• <code>http://login:password@ip:port</code>"
+    )
+    kb = _make_kb([[("❌ Отмена", "src_lots_menu")]])
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _test_proxies_worker(chat_id, message_id=None):
+    proxies = _load_proxies()
+    if not proxies:
+        _tg_edit(chat_id, message_id, "⚠️ Список прокси пуст. Добавьте прокси для проверки.", _make_kb([[("◀️ Назад", "src_proxies")]]))
+        return
+    _tg_edit(chat_id, message_id, f"⏳ <b>Тестирование {len(proxies)} прокси...</b>\nПожалуйста, подождите.", _make_kb([[("◀️ Назад", "src_proxies")]]))
+    _log_event("pool_proxy_test_start", count=len(proxies))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    async def _test_all():
+        details = []
+        alive = 0
+        dead = 0
+        sem = asyncio.Semaphore(10)
+        async def _check(p):
+            nonlocal alive, dead
+            clean_p = _mask_proxy(p)
+            async with sem:
+                ok, diag = await check_proxy(p, timeout=8.0)
+                if ok:
+                    alive += 1
+                    details.append(f"🟢 <code>{clean_p}</code> → {diag} (Steam OK)")
+                    _log_event("pool_proxy_test", status="ok", proxy=clean_p, diag=diag)
+                else:
+                    dead += 1
+                    details.append(f"🔴 <code>{clean_p}</code> → {diag}")
+                    _log_event("pool_proxy_test", level=logging.WARNING, status="fail", proxy=clean_p, diag=diag)
+        await asyncio.gather(*[_check(p) for p in proxies])
+        return alive, dead, details
+    try:
+        alive, dead, details = loop.run_until_complete(_test_all())
+        _log_event("pool_proxy_summary", total=len(proxies), alive=alive, dead=dead)
+        det_str = "\n".join(details[:10])
+        if len(details) > 10:
+            det_str += f"\n<i>... и ещё {len(details) - 10} прокси</i>"
+        res_text = (
+            f"🧪 <b>Результаты тестирования общей базы:</b>\n\n"
+            f"• Проверено: <b>{len(proxies)}</b>\n"
+            f"• Живые (Steam доступен): <b>🟢 {alive}</b>\n"
+            f"• Недоступны / таймаут: <b>🔴 {dead}</b>\n\n"
+            f"<b>Статус по прокси:</b>\n{det_str}"
+        )
+    except Exception as e:
+        _log_event("pool_proxy_test_error", level=logging.ERROR, err=str(e))
+        res_text = f"❌ Ошибка проверки прокси: {e}"
+    finally:
+        loop.close()
+    kb = _make_kb([[("🔄 Проверить снова", "src_test_proxies"), ("◀️ К прокси", "src_proxies")]])
+    _tg_edit(chat_id, message_id, res_text, kb)
+def _stats_text():
+    stats = _load_stats()
+    return (
+        f"📊 <b>Статистика {NAME}</b>\n\n"
+        f"• Всего попыток: <b>{stats.get('total_operations', 0)}</b>\n"
+        f"• Успешно сменено: <b>🟢 {stats.get('success', 0)}</b>\n"
+        f"• Ошибок / отмен: <b>🔴 {stats.get('failed', 0)}</b>\n"
+        f"• Активировано гифтов: <b>🎁 {stats.get('gifts_redeemed', 0)}</b>\n"
+        f"• Последняя операция: <code>{stats.get('last_operation', 'нет данных')}</code>"
+    )
+def _stats_kb():
+    return _make_kb([
+        [("🔄 Сбросить статистику", "src_stats_reset")],
+        [("◀️ Назад", "src_settings_panel")],
+    ])
+def _open_stats(chat_id, message_id=None):
+    _waiting.pop(chat_id, None)
+    text = _stats_text()
+    kb = _stats_kb()
+    _tg_edit(chat_id, message_id, text, kb) if message_id else _tg_send(chat_id, text, kb)
+def _plugin_version_key(value):
+    nums = [int(x) for x in re.findall(r'\d+', str(value or ''))[:4]]
+    nums.extend([0] * (4 - len(nums)))
+    return tuple(nums[:4])
+def _online_update_worker(chat_id, message_id=None):
+    _tg_edit(chat_id, message_id, "⏳ <b>Проверка обновлений на GitHub...</b>", _make_kb([[("◀️ Назад", "src_update_menu")]]))
+    try:
+        resp = requests.get(GITHUB_UPDATE_URL, timeout=15)
+        if resp.status_code != 200 or not resp.content:
+            _tg_edit(chat_id, message_id, f"⚠️ Не удалось загрузить обновление с GitHub (код {resp.status_code}).\nПроверьте репозиторий: {GITHUB_URL}", _make_kb([[("◀️ Назад", "src_update_menu")]]))
+            return
+        source = resp.text
+        m = re.search(r'(?m)^\s*VERSION\s*=\s*["\']([^"\']+)["\']', source)
+        if not m:
+            _tg_edit(chat_id, message_id, "❌ В файле на GitHub не найдено поле VERSION.", _make_kb([[("◀️ Назад", "src_update_menu")]]))
+            return
+        remote_version = m.group(1).strip()
+        if _plugin_version_key(remote_version) <= _plugin_version_key(VERSION):
+            _tg_edit(chat_id, message_id, f"✅ <b>У вас уже установлена актуальная версия {VERSION}.</b>", _make_kb([[("◀️ Назад", "src_update_menu")]]))
+            return
+        plugin_file = os.path.abspath(__file__)
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        backup_file = plugin_file + f'.pre-online-update.{stamp}.bak'
+        shutil.copy2(plugin_file, backup_file)
+        with open(plugin_file, "w", encoding="utf-8") as f:
+            f.write(source)
+        text = f"✅ <b>Онлайн-обновление установлено: v{remote_version}!</b>\n\nРезервная копия сохранена в <code>{os.path.basename(backup_file)}</code>.\nВыполните <code>/restart</code> для применения."
+        _tg_edit(chat_id, message_id, text, _make_kb([[("◀️ В меню", "src_home")]]))
+    except Exception as e:
+        _tg_edit(chat_id, message_id, f"❌ Ошибка обновления: {e}", _make_kb([[("◀️ Назад", "src_update_menu")]]))
+def _self_delete(chat_id, message_id=None):
+    errors = []
+    try:
+        shutil.rmtree(STORAGE_DIR, ignore_errors=True)
+    except Exception as e:
+        errors.append(f"данные: {e}")
+    plugin_file = os.path.abspath(__file__)
+    try:
+        if os.path.exists(plugin_file):
+            os.remove(plugin_file)
+    except Exception as e:
+        errors.append(f"файл: {e}")
+    if not errors:
+        text = f"✅ <b>Плагин {NAME} успешно удалён.</b>\n\nВыполните команду <code>/restart</code>."
+    else:
+        text = f"⚠️ <b>Плагин удалён с замечаниями:</b>\n" + "\n".join(errors)
+    _tg_edit(chat_id, message_id, text, _make_kb([[("🔙 К списку плагинов", CB_PLUGINS_LIST_OPEN)]]))
+def _cb_router(call):
+    chat_id = getattr(getattr(getattr(call, 'message', None), 'chat', None), 'id', None)
+    message_id = getattr(getattr(call, 'message', None), 'message_id', None)
+    data = str(getattr(call, 'data', '') or '')
+    from_user = getattr(call, 'from_user', None)
+    user_id = getattr(from_user, 'id', None)
+    if not chat_id or not _is_authorized(user_id):
+        return
+    try:
+        bot_instance.answer_callback_query(call.id)
+    except Exception:
+        pass
+    if data == "src_home":
+        _open_home(chat_id, message_id)
+    elif data == "src_info":
+        _open_info(chat_id, message_id)
+    elif data == "src_update_menu":
+        _open_update_menu(chat_id, message_id)
+    elif data == "src_settings_panel":
+        _open_settings_panel(chat_id, message_id)
+    elif data == "src_delete_ask":
+        _open_delete_confirm(chat_id, message_id)
+    elif data == "src_delete_yes":
+        _self_delete(chat_id, message_id)
+    elif data == "src_update_local":
+        _waiting[chat_id] = {"action": "update_local", "prompt_id": message_id}
+        text = (
+            "📥 <b>Локальное обновление</b>\n\n"
+            f"Пришлите новый файл <code>SRC-Plugin.py</code> с расширением <code>.py</code> в этот чат.\n"
+            "После проверки файл заменит текущий плагин. Старый файл будет сохранён в резервной копии.\n\n"
+            "Для отмены нажмите кнопку ниже."
+        )
+        _tg_edit(chat_id, message_id, text, _make_kb([[("❌ Отмена", "src_update_menu")]]))
+    elif data == "src_update_online":
+        threading.Thread(target=_online_update_worker, args=(chat_id, message_id), daemon=True).start()
+    elif data == "src_mini_settings":
+        _open_mini_settings(chat_id, message_id)
+    elif data == "src_lots_menu":
+        _open_lots_menu(chat_id, message_id)
+    elif data.startswith("src_lots_page:"):
+        p = int(data.split(":", 1)[1])
+        _open_lots_menu(chat_id, message_id, page=p)
+    elif data == "src_lots_noop":
+        pass
+    elif data == "src_stats":
+        _open_stats(chat_id, message_id)
+    elif data == "src_tgl_state":
+        cfg = _load_config()
+        cfg["plugin_enabled"] = not cfg.get("plugin_enabled", True)
+        _save_config(cfg)
+        _open_mini_settings(chat_id, message_id)
+    elif data == "src_cat_orders":
+        _open_orders_menu(chat_id, message_id)
+    elif data in ("src_cycle_qr_mode", "src_tgl_login_by_qr"):
+        cfg = _load_config()
+        curr_mode = _get_qr_mode(cfg)
+        modes = ["choice", "qr_only", "off"]
+        idx = modes.index(curr_mode) if curr_mode in modes else 0
+        new_mode = modes[(idx + 1) % len(modes)]
+        cfg["qr_login_mode"] = new_mode
+        cfg["login_by_qr"] = (new_mode != "off")
+        _save_config(cfg)
+        _open_orders_menu(chat_id, message_id)
+    elif data == "src_tgl_refund":
+        cfg = _load_config()
+        cfg["auto_refund_enabled"] = not cfg.get("auto_refund_enabled", True)
+        _save_config(cfg)
+        _open_orders_menu(chat_id, message_id)
+    elif data == "src_cat_refunds":
+        _open_refunds_menu(chat_id, message_id)
+    elif data == "src_tgl_refund_master":
+        cfg = _load_config()
+        cfg["auto_refund_enabled"] = not cfg.get("auto_refund_enabled", True)
+        _save_config(cfg)
+        _open_refunds_menu(chat_id, message_id)
+    elif data.startswith("src_tgl_ref_reason:"):
+        code = data.split(":", 1)[1]
+        cfg = _load_config()
+        reasons = cfg.get("refund_reasons")
+        if not isinstance(reasons, dict):
+            reasons = dict(DEFAULT_REFUND_REASONS)
+        current_val = reasons.get(code, DEFAULT_REFUND_REASONS.get(code, False))
+        reasons[code] = not current_val
+        cfg["refund_reasons"] = reasons
+        _save_config(cfg)
+        _open_refunds_menu(chat_id, message_id)
+    elif data == "src_tgl_funding":
+        cfg = _load_config()
+        cfg["check_steam_funding"] = not cfg.get("check_steam_funding", True)
+        _save_config(cfg)
+        _open_orders_menu(chat_id, message_id)
+    elif data == "src_tgl_deact":
+        cfg = _load_config()
+        cfg["auto_deactivate_lots"] = not cfg.get("auto_deactivate_lots", True)
+        _save_config(cfg)
+        _open_orders_menu(chat_id, message_id)
+    elif data == "src_tgl_inact_remind":
+        cfg = _load_config()
+        cfg["buyer_inactivity_reminders"] = not cfg.get("buyer_inactivity_reminders", True)
+        _save_config(cfg)
+        _open_orders_menu(chat_id, message_id)
+    elif data == "src_cat_notif":
+        _open_notif_menu(chat_id, message_id)
+    elif data == "src_tgl_notif_orders":
+        cfg = _load_config()
+        cfg["notify_tg_orders"] = not cfg.get("notify_tg_orders", True)
+        _save_config(cfg)
+        _open_notif_menu(chat_id, message_id)
+    elif data == "src_tgl_notif_success":
+        cfg = _load_config()
+        cfg["notify_tg_success"] = not cfg.get("notify_tg_success", True)
+        _save_config(cfg)
+        _open_notif_menu(chat_id, message_id)
+    elif data == "src_tgl_notif_errors":
+        cfg = _load_config()
+        cfg["notify_tg_errors"] = not cfg.get("notify_tg_errors", True)
+        _save_config(cfg)
+        _open_notif_menu(chat_id, message_id)
+    elif data == "src_cat_messages":
+        _open_messages_menu(chat_id, message_id)
+    elif data.startswith("src_msg_view:"):
+        key = data.split(":", 1)[1]
+        _open_msg_editor(chat_id, key, message_id)
+    elif data.startswith("src_msg_reset_one:"):
+        key = data.split(":", 1)[1]
+        cfg = _load_config()
+        bm = cfg.get("buyer_messages") or {}
+        if key in bm:
+            bm.pop(key, None)
+            cfg["buyer_messages"] = bm
+            _save_config(cfg)
+        _open_msg_editor(chat_id, key, message_id)
+    elif data == "src_msg_reset_all":
+        cfg = _load_config()
+        cfg["buyer_messages"] = dict(DEFAULT_BUYER_MESSAGES)
+        _save_config(cfg)
+        _open_messages_menu(chat_id, message_id)
+    elif data == "src_cat_queue":
+        _open_queue_menu(chat_id, message_id)
+    elif data in ("src_cycle_workers", "src_set_workers"):
+        _waiting[chat_id] = {"action": "input_workers", "prompt_id": message_id}
+        cfg = _load_config()
+        cur = cfg.get("max_workers", 5)
+        text = (
+            f"⚡ <b>Количество одновременных смен</b>\n\n"
+            f"Текущее значение: <b>{cur}</b>\n\n"
+            "Введите желаемое число параллельных замен аккаунтов (например: <code>5</code> или <code>10</code>):"
+        )
+        _tg_edit(chat_id, message_id, text, _make_kb([[("❌ Отмена", "src_cat_queue")]]))
+    elif data in ("src_cycle_timeout", "src_set_timeout"):
+        _waiting[chat_id] = {"action": "input_timeout", "prompt_id": message_id}
+        cfg = _load_config()
+        cur = int(cfg.get("request_timeout", 30.0))
+        text = (
+            f"⏱ <b>Таймаут сетевых запросов</b>\n\n"
+            f"Текущее значение: <b>{cur} сек</b>\n\n"
+            "Введите таймаут запросов в секундах (например: <code>30</code> или <code>60</code>):"
+        )
+        _tg_edit(chat_id, message_id, text, _make_kb([[("❌ Отмена", "src_cat_queue")]]))
+    elif data == "src_cat_maint":
+        _open_maint_menu(chat_id, message_id)
+    elif data == "src_maint_cfg_menu":
+        _open_maint_cfg_menu(chat_id, message_id)
+    elif data == "src_maint_export_cfg":
+        if os.path.exists(CONFIG_FILE) and bot_instance:
+            try:
+                with open(CONFIG_FILE, "rb") as doc:
+                    bot_instance.send_document(chat_id, doc, caption=f"📄 Конфигурация {NAME} (settings.json)")
+            except Exception as e:
+                _tg_send(chat_id, f"❌ Ошибка отправки файла: {e}")
+    elif data == "src_maint_import_cfg":
+        _waiting[chat_id] = {"action": "import_config", "prompt_id": message_id}
+        text = "📥 <b>Отправьте файл settings.json или текст JSON в этот чат:</b>"
+        _tg_edit(chat_id, message_id, text, _make_kb([[("❌ Отмена", "src_maint_cfg_menu")]]))
+    elif data == "src_maint_download_logs":
+        log_paths = [
+            PLUGIN_LOG_FILE,
+            os.path.join(BASE_DIR, "logs", "cardinal.log"),
+            os.path.join(BASE_DIR, "cardinal.log"),
+        ]
+        sent = False
+        last_err = ""
+        for lp in log_paths:
+            if os.path.exists(lp) and os.path.getsize(lp) > 0 and bot_instance:
+                try:
+                    with open(lp, "rb") as doc:
+                        bot_instance.send_document(chat_id, doc, caption=f"📄 Лог {os.path.basename(lp)} ({NAME})")
+                    sent = True
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    logger.warning(f"[{NAME}] Ошибка отправки лог-файла {lp} в TG: {e}")
+        if not sent:
+            if last_err:
+                _tg_send(chat_id, f"❌ Ошибка отправки файла логов: {last_err}")
+            else:
+                _tg_send(chat_id, "ℹ️ Файл логов пока не найден или пуст.")
+    elif data == "src_gifts":
+        _waiting.pop(chat_id, None)
+        _menu_gifts(chat_id, message_id)
+    elif data == "src_tgl_redeem":
+        cfg = _load_config()
+        cfg["auto_redeem_gift"] = not cfg.get("auto_redeem_gift", True)
+        _save_config(cfg)
+        _menu_gifts(chat_id, message_id)
+    elif data == "src_input_gifts":
+        _waiting[chat_id] = {"action": "input_gifts", "prompt_id": message_id}
+        text = (
+            "➕ <b>Добавление кодов Steam Wallet</b>\n\n"
+            "Вы можете:\n"
+            "1. Отправить список кодов текстом (каждый с новой строки)\n"
+            "2. Загрузить текстовый файл <code>.txt</code> с кодами"
+        )
+        codes = _load_gift_codes()
+        rows = []
+        if codes:
+            rows.append([("💾 Скачать базу ключей (.txt)", "src_export_gifts")])
+        rows.append([("❌ Отмена", "src_gifts")])
+        _tg_edit(chat_id, message_id, text, _make_kb(rows))
+    elif data == "src_export_gifts":
+        codes = _load_gift_codes()
+        if not codes:
+            _tg_send(chat_id, "ℹ️ База ключей пуста.")
+        elif bot_instance:
+            try:
+                bio = io.BytesIO("\n".join(codes).encode('utf-8'))
+                bio.name = "steam_gift_codes.txt"
+                bot_instance.send_document(chat_id, bio, caption=f"🎁 База ключей Steam ({len(codes)} шт.)")
+            except Exception as e:
+                _tg_send(chat_id, f"❌ Ошибка отправки файла: {e}")
+    elif data == "src_clear_gifts_ask":
+        text = "⚠️ <b>Очистить все сохранённые гифт-коды?</b>"
+        _tg_edit(chat_id, message_id, text, _make_kb([[("✅ Да, очистить", "src_clear_gifts_yes"), ("❌ Отмена", "src_gifts")]]))
+    elif data == "src_clear_gifts_yes":
+        _save_gift_codes([])
+        _menu_gifts(chat_id, message_id)
+    elif data == "src_proxies":
+        _waiting.pop(chat_id, None)
+        _menu_proxies(chat_id, message_id)
+    elif data == "src_input_proxies":
+        _waiting[chat_id] = {"action": "input_proxies", "prompt_id": message_id}
+        text = (
+            "➕ <b>Отправьте список прокси</b> (каждый с новой строки) или <b>.txt файл</b>:\n\n"
+            "Форматы:\n"
+            "• <code>ip:port</code>\n"
+            "• <code>ip:port:user:pass</code>\n"
+            "• <code>http://user:pass@ip:port</code>"
+        )
+        _tg_edit(chat_id, message_id, text, _make_kb([[("❌ Отмена", "src_proxies")]]))
+    elif data == "src_clear_proxies_ask":
+        text = "⚠️ <b>Очистить всю общую базу прокси?</b>"
+        _tg_edit(chat_id, message_id, text, _make_kb([[("✅ Да, очистить", "src_clear_proxies_yes"), ("❌ Отмена", "src_proxies")]]))
+    elif data == "src_clear_proxies_yes":
+        _save_proxies([])
+        _menu_proxies(chat_id, message_id)
+    elif data == "src_test_proxies":
+        threading.Thread(target=_test_proxies_worker, args=(chat_id, message_id), daemon=True).start()
+    elif data == "src_lots_auto_2044":
+        _handle_auto_lots_2044(chat_id, message_id)
+    elif data == "src_lot_add_wizard":
+        _start_lot_wizard(chat_id, message_id)
+    elif data.startswith("src_wiz_cc:"):
+        cc = data.split(":", 1)[1].upper()
+        st = _waiting.get(chat_id) or {}
+        lid = st.get("lot_id", "")
+        title = st.get("title", f"Лот {lid}")
+        _lot_wizard_ask_proxy(chat_id, lid, title, cc, message_id)
+    elif data == "src_lots_clear_ask":
+        text = "⚠️ <b>Очистить все привязанные лоты?</b>"
+        _tg_edit(chat_id, message_id, text, _make_kb([[("✅ Да, очистить", "src_lots_clear_yes"), ("❌ Отмена", "src_lots_menu")]]))
+    elif data == "src_lots_clear_yes":
+        cfg = _load_config()
+        cfg["lots"] = {}
+        _save_config(cfg)
+        _open_lots_menu(chat_id, message_id)
+    elif data == "src_lots_bulk_menu":
+        _open_lots_bulk_menu(chat_id, message_id)
+    elif data.startswith("src_lots_bulk_toggle:"):
+        action = data.split(":", 1)[1]
+        enable = (action == "enable")
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        for l in lots.values():
+            l["enabled"] = enable
+        cfg["lots"] = lots
+        _save_config(cfg)
+        _open_lots_bulk_menu(chat_id, message_id)
+        if cfg.get("auto_deactivate_lots", True):
+            def _sync_fp_bulk_toggle():
+                for lid in list(lots.keys()):
+                    try:
+                        _set_funpay_lot_active(cardinal_instance, lid, enable)
+                    except Exception as e:
+                        logger.warning(f"[{NAME}] Ошибка синхронизации статуса лота #{lid} на FunPay: {e}")
+            threading.Thread(target=_sync_fp_bulk_toggle, daemon=True).start()
+    elif data == "src_lots_bulk_del_ask":
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        total = len(lots)
+        text = (
+            f"🗑 <b>Удаление всех лотов ({total} шт.)</b>\n\n"
+            f"⚠️ <b>Выберите вариант удаления:</b>\n\n"
+            f"1️⃣ <b>Из плагина</b> — лоты удаляются только из базы плагина. На сайте FunPay лоты останутся без изменений.\n\n"
+            f"2️⃣ <b>Из плагина и FunPay</b> — лоты будут удалены из плагина и навсегда удалены с сайта FunPay."
+        )
+        rows = [
+            [("📦 Из плагина", "src_lots_bulk_del_plugin")],
+            [("💥 Из плагина и FunPay", "src_lots_bulk_del_both_ask")],
+            [("◀️ Отмена", "src_lots_bulk_menu")],
+        ]
+        _tg_edit(chat_id, message_id, text, _make_kb(rows))
+    elif data == "src_lots_bulk_del_plugin":
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        count = len(lots)
+        cfg["lots"] = {}
+        _save_config(cfg)
+        text = (
+            f"✅ <b>Все лоты удалены из плагина!</b>\n\n"
+            f"• Удалено из плагина: <b>{count} шт.</b>\n"
+            f"• Лоты на FunPay сохранены без изменений."
+        )
+        _tg_edit(chat_id, message_id, text, _make_kb([[("⭐ К списку лотов", "src_lots_menu")]]))
+    elif data == "src_lots_bulk_del_both_ask":
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        total = len(lots)
+        text = (
+            f"⚠️ <b>Подтверждение полного удаления</b>\n\n"
+            f"Вы уверены, что хотите удалить <b>{total} шт.</b> лотов из плагина <b>и навсегда с сайта FunPay</b>?\n\n"
+            f"❗️ <i>Восстановить удалённые с FunPay лоты будет невозможно!</i>"
+        )
+        rows = [
+            [("💥 Да, удалить отовсюду", "src_lots_bulk_del_both_yes")],
+            [("◀️ Отмена", "src_lots_bulk_del_ask")],
+        ]
+        _tg_edit(chat_id, message_id, text, _make_kb(rows))
+    elif data == "src_lots_bulk_del_both_yes":
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        total = len(lots)
+        _tg_edit(chat_id, message_id, "⏳ <b>Удаление лотов с FunPay и из плагина... Пожалуйста, подождите.</b>")
+        def _delete_both_worker():
+            fp_deleted = 0
+            fp_failed = 0
+            for lid in list(lots.keys()):
+                ok = _delete_funpay_lot(cardinal_instance, lid)
+                if ok:
+                    fp_deleted += 1
+                else:
+                    fp_failed += 1
+            curr_cfg = _load_config()
+            curr_cfg["lots"] = {}
+            _save_config(curr_cfg)
+            msg = (
+                f"✅ <b>Удаление завершено!</b>\n\n"
+                f"• Удалено из базы плагина: <b>{total} шт.</b>\n"
+                f"• Удалено с сайта FunPay: <b>{fp_deleted} шт.</b>\n"
+            )
+            if fp_failed > 0:
+                msg += f"• Ошибок при удалении с FunPay: <b>{fp_failed} шт.</b>\n"
+            _tg_edit(chat_id, message_id, msg, _make_kb([[("⭐ К списку лотов", "src_lots_menu")]]))
+        threading.Thread(target=_delete_both_worker, daemon=True).start()
+    elif data.startswith("src_lot_card:"):
+        lid = data.split(":", 1)[1]
+        _open_lot_card(chat_id, lid, message_id)
+    elif data.startswith("src_lot_tgl:"):
+        lid = data.split(":", 1)[1]
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        if lid in lots:
+            new_st = not lots[lid].get("enabled", True)
+            lots[lid]["enabled"] = new_st
+            cfg["lots"] = lots
+            _save_config(cfg)
+            if cfg.get("auto_deactivate_lots", True):
+                _set_funpay_lot_active(cardinal_instance, lid, new_st)
+        _open_lot_card(chat_id, lid, message_id)
+    elif data.startswith("src_lot_change_cc:"):
+        lid = data.split(":", 1)[1]
+        _open_lot_change_cc(chat_id, lid, message_id)
+    elif data.startswith("src_lot_set_cc:"):
+        parts = data.split(":")
+        lid, cc = parts[1], parts[2].upper()
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        if lid in lots:
+            lots[lid]["country"] = cc
+            cfg["lots"] = lots
+            _save_config(cfg)
+        _open_lot_card(chat_id, lid, message_id)
+    elif data.startswith("src_lot_input_cc:"):
+        lid = data.split(":", 1)[1]
+        _waiting[chat_id] = {"action": "lot_input_cc", "lot_id": lid, "prompt_id": message_id}
+        text = f"✍️ <b>Введите двухбуквенный код страны для лота #{lid}</b> (например: <code>KZ</code>, <code>US</code>, <code>RU</code>):"
+        _tg_edit(chat_id, message_id, text, _make_kb([[("❌ Отмена", f"src_lot_card:{lid}")]]))
+    elif data.startswith("src_lot_px_menu:"):
+        lid = data.split(":", 1)[1]
+        _open_lot_proxies_menu(chat_id, lid, message_id)
+    elif data.startswith("src_lot_add_px:"):
+        lid = data.split(":", 1)[1]
+        _waiting[chat_id] = {"action": "lot_add_px", "lot_id": lid, "prompt_id": message_id}
+        text = (
+            f"➕ <b>Добавление прокси для лота #{lid}</b>\n\n"
+            "Вы можете:\n"
+            "1. Отправить список прокси текстом (каждый с новой строки)\n"
+            "2. Загрузить файл <code>.txt</code> со списком прокси\n\n"
+            "<b>Форматы (HTTP/HTTPS):</b>\n"
+            "• <code>ip:port</code>\n"
+            "• <code>ip:port:user:pass</code>\n"
+            "• <code>http://user:pass@ip:port</code>"
+        )
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        proxies = (lots.get(str(lid)) or {}).get("proxies", [])
+        rows = []
+        if proxies:
+            rows.append([("💾 Скачать текущие прокси (.txt)", f"src_lot_export_px:{lid}")])
+        rows.append([("❌ Отмена", f"src_lot_px_menu:{lid}")])
+        _tg_edit(chat_id, message_id, text, _make_kb(rows))
+    elif data.startswith("src_lot_export_px:"):
+        lid = data.split(":", 1)[1]
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        proxies = (lots.get(str(lid)) or {}).get("proxies", [])
+        if not proxies:
+            _tg_send(chat_id, f"ℹ️ У лота #{lid} нет привязанных прокси.")
+        elif bot_instance:
+            try:
+                bio = io.BytesIO("\n".join(proxies).encode('utf-8'))
+                bio.name = f"proxies_lot_{lid}.txt"
+                bot_instance.send_document(chat_id, bio, caption=f"🌐 Прокси лота #{lid} ({len(proxies)} шт.)")
+            except Exception as e:
+                _tg_send(chat_id, f"❌ Ошибка отправки файла: {e}")
+    elif data.startswith("src_lot_test_px:"):
+        lid = data.split(":", 1)[1]
+        threading.Thread(target=_test_lot_proxies_worker, args=(chat_id, lid, message_id), daemon=True).start()
+    elif data.startswith("src_lot_clear_px:"):
+        lid = data.split(":", 1)[1]
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        if lid in lots:
+            lots[lid]["proxies"] = []
+            if cfg.get("auto_deactivate_lots", True):
+                lots[lid]["enabled"] = False
+                _deactivate_funpay_lot(cardinal_instance, lid)
+            cfg["lots"] = lots
+            _save_config(cfg)
+        _open_lot_proxies_menu(chat_id, lid, message_id)
+    elif data.startswith("src_lot_delete_ask:"):
+        lid = data.split(":", 1)[1]
+        text = f"⚠️ <b>Удалить лот #{lid} из плагина?</b>"
+        _tg_edit(chat_id, message_id, text, _make_kb([[("✅ Да, удалить", f"src_lot_delete_yes:{lid}"), ("❌ Отмена", f"src_lot_card:{lid}")]]))
+    elif data.startswith("src_lot_delete_yes:"):
+        lid = data.split(":", 1)[1]
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        lots.pop(lid, None)
+        cfg["lots"] = lots
+        _save_config(cfg)
+        _open_lots_menu(chat_id, message_id)
+    elif data == "src_stats_reset":
+        _save_stats(DEFAULT_STATS)
+        _open_stats(chat_id, message_id)
+def _handle_waiting_message(message):
+    chat_id = getattr(getattr(message, 'chat', None), 'id', None)
+    from_user = getattr(message, 'from_user', None)
+    user_id = getattr(from_user, 'id', None)
+    if not chat_id or not _is_authorized(user_id):
+        return
+    document = getattr(message, 'document', None)
+    file_text = None
+    if document is not None:
+        file_name = str(getattr(document, 'file_name', '') or '').strip()
+        st = _waiting.get(chat_id) or {}
+        if st.get("action") == "update_local" or file_name.endswith('.py'):
+            if file_name.endswith('.py'):
+                try:
+                    file_info = bot_instance.get_file(document.file_id)
+                    payload = bot_instance.download_file(file_info.file_path)
+                    source = payload.decode('utf-8-sig')
+                    plugin_file = os.path.abspath(__file__)
+                    compile(source, plugin_file, 'exec')
+                    m = re.search(r'(?m)^\s*VERSION\s*=\s*["\']([^"\']+)["\']', source)
+                    new_ver = m.group(1).strip() if m else 'неизвестно'
+                    stamp = time.strftime('%Y%m%d-%H%M%S')
+                    backup_file = plugin_file + f'.pre-local-update.{stamp}.bak'
+                    shutil.copy2(plugin_file, backup_file)
+                    with open(plugin_file, "w", encoding="utf-8") as f:
+                        f.write(source)
+                    _waiting.pop(chat_id, None)
+                    _tg_send(chat_id, f"✅ <b>Локальное обновление установлено: v{new_ver}!</b>\n\nРезервная копия: <code>{os.path.basename(backup_file)}</code>\nВыполните <code>/restart</code> для применения.", _make_kb([[("◀️ В меню", "src_home")]]))
+                    return
+                except Exception as e:
+                    _tg_send(chat_id, f"❌ Ошибка проверки/установки файла: {e}")
+                    return
+        if st.get("action") == "import_config" or file_name.endswith('.json'):
+            try:
+                file_info = bot_instance.get_file(document.file_id)
+                payload = bot_instance.download_file(file_info.file_path)
+                data = json.loads(payload.decode('utf-8-sig'))
+                if isinstance(data, dict):
+                    stamp = time.strftime('%Y%m%d-%H%M%S')
+                    if os.path.exists(CONFIG_FILE):
+                        shutil.copy2(CONFIG_FILE, CONFIG_FILE + f'.{stamp}.bak')
+                    _save_config(data)
+                    _waiting.pop(chat_id, None)
+                    _tg_send(chat_id, "✅ <b>Конфигурация успешно импортирована!</b>", _make_kb([[("⚙️ В настройки", "src_mini_settings")]]))
+                    return
+            except Exception as e:
+                _tg_send(chat_id, f"❌ Ошибка импорта конфига: {e}")
+                return
+        if file_name.endswith('.txt') or st.get("action") in ("input_gifts", "lot_add_px", "wiz_step3_proxy", "input_proxies"):
+            try:
+                file_info = bot_instance.get_file(document.file_id)
+                payload = bot_instance.download_file(file_info.file_path)
+                file_text = payload.decode('utf-8-sig', errors='ignore').strip()
+            except Exception as e:
+                _tg_send(chat_id, f"❌ Ошибка чтения файла: {e}")
+                return
+    st = _waiting.get(chat_id)
+    if not st:
+        return
+    action = st.get("action")
+    text = (file_text if file_text is not None else str(getattr(message, "text", "") or "")).strip()
+    if action == "import_config":
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                stamp = time.strftime('%Y%m%d-%H%M%S')
+                if os.path.exists(CONFIG_FILE):
+                    shutil.copy2(CONFIG_FILE, CONFIG_FILE + f'.{stamp}.bak')
+                _save_config(data)
+                _waiting.pop(chat_id, None)
+                _tg_send(chat_id, "✅ <b>Конфигурация успешно импортирована!</b>", _make_kb([[("⚙️ В настройки", "src_mini_settings")]]))
+                return
+        except Exception as e:
+            _tg_send(chat_id, f"❌ Ошибка разбора JSON: {e}")
+            return
+    elif action == "wiz_step1_id":
+        lot_id = re.sub(r'\D', '', text)
+        if not lot_id:
+            _tg_send(chat_id, "⚠️ ID лота должен содержать только цифры. Попробуйте ещё раз:")
+            return
+        title = f"Лот #{lot_id}"
+        try:
+            if cardinal_instance and getattr(cardinal_instance, 'account', None):
+                lf = cardinal_instance.account.get_lot_fields(int(lot_id))
+                if lf and getattr(lf, 'description', None):
+                    title = lf.description
+        except Exception:
+            pass
+        _lot_wizard_ask_country(chat_id, lot_id, title)
+    elif action == "wiz_step2_country":
+        cc = re.sub(r'[^A-Za-z]', '', text).upper()
+        if len(cc) == 2:
+            lid = st.get("lot_id", "")
+            title = st.get("title", f"Лот {lid}")
+            _lot_wizard_ask_proxy(chat_id, lid, title, cc)
+        else:
+            _tg_send(chat_id, "⚠️ Код страны должен состоять ровно из 2 букв (например KZ, US, RU). Выберите кнопку или введите 2 буквы:")
+    elif action == "wiz_step3_proxy":
+        lower_t = text.lower()
+        if any(w in lower_t for w in ["нет", "нету", "no", "none", "-", "отсутствует"]):
+            _tg_send(chat_id, "⚠️ <b>Для добавления лота необходим прокси!</b>\n\nБез прокси смена региона Steam невозможна. Отправьте хотя бы один рабочий прокси под этот регион или нажмите «Отмена».")
+            return
+        new_p = parse_proxies(text)
+        if not new_p:
+            _tg_send(
+                chat_id,
+                "⚠️ Не удалось распознать прокси. Пожалуйста, отправьте прокси в поддерживаемом формате:\n"
+                "• <code>ip:port</code>\n"
+                "• <code>ip:port:login:password</code>\n"
+                "• <code>http://ip:port</code>\n"
+                "• <code>http://login:password@ip:port</code>"
+            )
+            return
+        lid = st.get("lot_id", "")
+        title = st.get("title", f"Лот #{lid}")
+        cc = st.get("country", "KZ")
+        cfg = _load_config()
+        lots = _get_lots_dict(cfg)
+        lots[lid] = {
+            "id": lid,
+            "title": title,
+            "enabled": True,
+            "country": cc,
+            "proxies": new_p,
+        }
+        cfg["lots"] = lots
+        _save_config(cfg)
+        _waiting.pop(chat_id, None)
+        msg = (
+            f"✅ <b>Лот #{lid} успешно настроен и добавлен!</b>\n\n"
+            f"• Название: <i>{title}</i>\n"
+            f"• Целевая страна: <b>{_country_display(cc)}</b> (<code>{cc}</code>)\n"
+            f"• Привязано прокси: <b>{len(new_p)} шт.</b>\n"
+            f"• Состояние: <b>🟢 Включён</b>\n\n"
+            "Теперь при покупке этого лота плагин сразу начнёт автоматическую смену региона."
+        )
+        _tg_send(chat_id, msg, _make_kb([[("⚙️ Настройки этого лота", f"src_lot_card:{lid}"), ("⭐ К списку лотов", "src_lots_menu")]]))
+    elif action == "lot_add_px":
+        lid = st.get("lot_id", "")
+        _waiting.pop(chat_id, None)
+        new_p = parse_proxies(text)
+        if new_p:
+            cfg = _load_config()
+            lots = _get_lots_dict(cfg)
+            if lid in lots:
+                old_p = lots[lid].get("proxies", [])
+                comb = list(dict.fromkeys(old_p + new_p))
+                lots[lid]["proxies"] = comb
+                cfg["lots"] = lots
+                _save_config(cfg)
+                _tg_send(chat_id, f"✅ Добавлено <b>{len(comb) - len(old_p)}</b> прокси к лоту #{lid}. Всего: <b>{len(comb)}</b>.")
+        else:
+            _tg_send(chat_id, "⚠️ Не удалось распознать прокси.")
+        _open_lot_proxies_menu(chat_id, lid)
+    elif action == "lot_input_cc":
+        lid = st.get("lot_id", "")
+        _waiting.pop(chat_id, None)
+        cc = re.sub(r'[^A-Za-z]', '', text).upper()
+        if len(cc) == 2:
+            cfg = _load_config()
+            lots = _get_lots_dict(cfg)
+            if lid in lots:
+                lots[lid]["country"] = cc
+                cfg["lots"] = lots
+                _save_config(cfg)
+                _tg_send(chat_id, f"✅ Страна для лота #{lid} изменена на <b>{_country_display(cc)}</b>.")
+        else:
+            _tg_send(chat_id, "⚠️ Код страны должен состоять ровно из 2 букв.")
+        _open_lot_card(chat_id, lid)
+    elif action == "input_proxies":
+        _waiting.pop(chat_id, None)
+        new_p = parse_proxies(text)
+        if new_p:
+            existing = _load_proxies()
+            combined = list(dict.fromkeys(existing + new_p))
+            _save_proxies(combined)
+            _tg_send(chat_id, f"✅ Добавлено <b>{len(combined) - len(existing)}</b> новых прокси. Всего в пуле: <b>{len(combined)}</b>.")
+        else:
+            _tg_send(chat_id, "⚠️ Не удалось распознать прокси в сообщении.")
+        _menu_proxies(chat_id)
+    elif action == "input_gifts":
+        _waiting.pop(chat_id, None)
+        raw_codes = parse_gift_codes(text)
+        valid, invalid = validate_gift_codes_format(raw_codes)
+        if valid:
+            existing = _load_gift_codes()
+            combined = list(dict.fromkeys(existing + valid))
+            _save_gift_codes(combined)
+            msg = f"✅ Добавлено <b>{len(combined) - len(existing)}</b> гифт-кодов. Всего доступно: <b>{len(combined)}</b>."
+            if invalid:
+                msg += f"\n⚠️ Пропущено невалидных кодов: {len(invalid)}."
+            _tg_send(chat_id, msg)
+        else:
+            _tg_send(chat_id, "⚠️ Валидных кодов Steam Wallet не найдено.")
+        _menu_gifts(chat_id)
+    elif action == "input_workers":
+        val_str = re.sub(r'\D', '', text)
+        if val_str and int(val_str) > 0:
+            val = min(50, max(1, int(val_str)))
+            cfg = _load_config()
+            cfg["max_workers"] = val
+            _save_config(cfg)
+            _waiting.pop(chat_id, None)
+            _tg_send(chat_id, f"✅ Установлено одновременных смен: <b>{val}</b>.")
+            _open_queue_menu(chat_id)
+        else:
+            _tg_send(chat_id, "⚠️ Введите целое число больше 0 (например: <code>5</code> или <code>10</code>):")
+    elif action == "input_timeout":
+        val_str = re.sub(r'[^\d.]', '', text)
+        try:
+            val = float(val_str)
+            if 5.0 <= val <= 300.0:
+                cfg = _load_config()
+                cfg["request_timeout"] = val
+                _save_config(cfg)
+                _waiting.pop(chat_id, None)
+                _tg_send(chat_id, f"✅ Установлен таймаут запросов: <b>{int(val)} сек</b>.")
+                _open_queue_menu(chat_id)
+            else:
+                _tg_send(chat_id, "⚠️ Таймаут должен быть в диапазоне от 5 до 300 секунд.")
+        except Exception:
+            _tg_send(chat_id, "⚠️ Введите число секунд (например: <code>30</code> или <code>60</code>):")
+    elif action == "edit_buyer_message":
+        key = st.get("key", "")
+        _waiting.pop(chat_id, None)
+        if key in BUYER_MESSAGE_LABELS and text:
+            cfg = _load_config()
+            bm = cfg.get("buyer_messages") or {}
+            bm[key] = text
+            cfg["buyer_messages"] = bm
+            _save_config(cfg)
+            _tg_send(
+                chat_id,
+                f"✅ Шаблон <b>«{BUYER_MESSAGE_LABELS[key]}»</b> успешно обновлен!",
+                _make_kb([[("💬 К списку сообщений", "src_cat_messages")]])
+            )
+        else:
+            _tg_send(chat_id, "⚠️ Текст не может быть пустым.")
+            _open_messages_menu(chat_id)
+_buyer_sessions: dict[Any, dict[str, Any]] = {}
+_active_sessions: list[dict[str, Any]] = []
+_sessions_lock = threading.Lock()
+_terminated_orders: set[str] = set()
+_terminated_orders_lock = threading.Lock()
+
+def _terminate_buyer_session(order_id: Any, reason: str = "", *, chat_id: Any = None) -> bool:
+    if not order_id:
+        return False
+    oid = str(order_id).strip().lstrip('#')
+    _cancel_qr_worker(oid, reason=f"terminate_{reason}")
+    with _terminated_orders_lock:
+        _terminated_orders.add(oid)
+
+    terminated_any = False
+    with _sessions_lock:
+        to_del = [k for k, v in _buyer_sessions.items() if str(v.get("order_id") or "").strip().lstrip('#') == oid]
+        matched_sessions = [s for s in _active_sessions if str(s.get("order_id") or "").strip().lstrip('#') == oid]
+        for s in matched_sessions:
+            s["canceled"] = True
+            s["step"] = "finished"
+            c_evt = s.get("cancel_qr_event")
+            if c_evt and isinstance(c_evt, threading.Event):
+                c_evt.set()
+            g_evt = s.get("guard_event")
+            if g_evt and isinstance(g_evt, threading.Event):
+                g_evt.set()
+            terminated_any = True
+
+        for k in to_del:
+            _buyer_sessions.pop(k, None)
+        _active_sessions[:] = [s for s in _active_sessions if str(s.get("order_id") or "").strip().lstrip('#') != oid]
+
+        if chat_id is not None:
+            to_del_chat = [
+                k for k, v in _buyer_sessions.items()
+                if str(v.get("chat_id") or "") == str(chat_id) and str(v.get("order_id") or "").strip().lstrip('#') == oid
+            ]
+            for k in to_del_chat:
+                _buyer_sessions.pop(k, None)
+
+    _log_event("session_terminated", order_id=oid, reason=reason)
+    return terminated_any
+
+def _extract_session_keys(sess: dict[str, Any]) -> set[Any]:
+    keys: set[Any] = set()
+    cid = sess.get("chat_id")
+    if cid is not None:
+        keys.add(cid)
+        keys.add(str(cid))
+        nums = re.findall(r'\d+', str(cid))
+        for num in nums:
+            try:
+                keys.add(int(num))
+            except Exception:
+                pass
+            keys.add(str(num))
+    bid = sess.get("buyer_id")
+    if bid is not None:
+        try:
+            keys.add(int(bid))
+        except Exception:
+            pass
+        keys.add(str(bid))
+    bname = str(sess.get("buyer_username") or "").strip().lower()
+    if bname and bname != '?':
+        keys.add(f"user:{bname}")
+    oid = str(sess.get("order_id") or "").strip()
+    if oid:
+        if oid.startswith('#'):
+            oid = oid[1:]
+        keys.add(f"order:{oid}")
+        keys.add(f"order:#{oid}")
+        keys.add(oid)
+    return keys
+def _register_buyer_session(sess: dict[str, Any], buyer_id: Any = None) -> None:
+    if buyer_id is not None:
+        sess["buyer_id"] = buyer_id
+    oid = str(sess.get("order_id") or "").strip().lstrip('#')
+    if oid:
+        with _terminated_orders_lock:
+            _terminated_orders.discard(oid)
+    with _sessions_lock:
+        raw_oid = str(sess.get("order_id") or "")
+        _active_sessions[:] = [
+            s for s in _active_sessions
+            if str(s.get("order_id") or "") != raw_oid and s.get("step") not in ("finished", "refunded", "failed_closed")
+        ]
+        _active_sessions.append(sess)
+        to_del = [k for k, v in _buyer_sessions.items() if str(v.get("order_id") or "") == raw_oid]
+        for k in to_del:
+            _buyer_sessions.pop(k, None)
+        for k in _extract_session_keys(sess):
+            _buyer_sessions[k] = sess
+def _find_buyer_session(
+    chat_id: Any = None,
+    chat_name: Any = None,
+    author: Any = None,
+    author_id: Any = None,
+    order_id: Any = None
+) -> dict[str, Any] | None:
+    with _sessions_lock:
+        if order_id:
+            target_oid = str(order_id).strip().lstrip('#')
+            with _terminated_orders_lock:
+                if target_oid in _terminated_orders:
+                    return None
+            for s in _active_sessions:
+                if str(s.get("order_id") or "").strip().lstrip('#') == target_oid:
+                    if s.get("step") not in ("finished", "refunded", "failed_closed"):
+                        return s
+        candidates: list[Any] = []
+        if chat_id is not None:
+            candidates.extend([chat_id, str(chat_id)])
+            try:
+                candidates.append(int(chat_id))
+            except Exception:
+                pass
+            for num in re.findall(r'\d+', str(chat_id)):
+                try:
+                    candidates.append(int(num))
+                except Exception:
+                    pass
+                candidates.append(str(num))
+        if author_id is not None:
+            candidates.extend([author_id, str(author_id)])
+            try:
+                candidates.append(int(author_id))
+            except Exception:
+                pass
+        if chat_name:
+            candidates.append(f"user:{str(chat_name).strip().lower()}")
+        if author:
+            candidates.append(f"user:{str(author).strip().lower()}")
+        matching: list[dict[str, Any]] = []
+        for s in _active_sessions:
+            if s.get("step") in ("finished", "refunded", "failed_closed"):
+                continue
+            s_oid = str(s.get("order_id") or "").strip().lstrip('#')
+            with _terminated_orders_lock:
+                if s_oid in _terminated_orders:
+                    continue
+            s_keys = _extract_session_keys(s)
+            if any(cand in s_keys for cand in candidates):
+                matching.append(s)
+        if not matching:
+            return None
+        if len(matching) == 1:
+            return matching[0]
+        input_waiting = [s for s in matching if s.get("step") in (
+            "waiting_choice", "waiting_qr_ready", "waiting_qr", "waiting_qr_timeout",
+            "waiting_qr_or_creds", "waiting_guard", "waiting_push", "waiting_password", "waiting_login", "waiting_credentials"
+        )]
+        if input_waiting:
+            return input_waiting[0]
+        return matching[-1]
+def _is_valid_steam_login(s: str) -> bool:
+    val = str(s or '').strip()
+    if not (2 <= len(val) <= 64):
+        return False
+    if any(c in val for c in (' ', '\t', '\n', '\r')):
+        return False
+    try:
+        val.encode('ascii')
+    except UnicodeEncodeError:
+        return False
+    if any(c in val for c in ('@', '!', '?', ',', ';', '/', '\\', '|', '<', '>', '"', "'", '`', '(', ')', '[', ']', '{', '}', '#', '$', '%', '^', '&', '*', '=')):
+        return False
+    return True
+def _extract_creds_from_text(text: str) -> tuple[str, str] | None:
+    txt = (text or "").strip()
+    if not txt:
+        return None
+    if ":" in txt:
+        parts = txt.split(":", 1)
+        p0, p1 = parts[0].strip(), parts[1].strip()
+        if _is_valid_steam_login(p0) and p1:
+            return (p0, p1)
+    if "\n" in txt:
+        lines = [l.strip() for l in txt.splitlines() if l.strip()]
+        if len(lines) >= 2 and _is_valid_steam_login(lines[0]) and lines[1]:
+            return (lines[0], lines[1])
+    return None
+
+_CYRILLIC_TO_LATIN_HOMOGLYPHS = {
+    'А': 'A', 'а': 'A',
+    'В': 'B', 'в': 'B',
+    'С': 'C', 'с': 'C',
+    'Е': 'E', 'е': 'E',
+    'Н': 'H', 'н': 'H',
+    'К': 'K', 'к': 'K',
+    'М': 'M', 'м': 'M',
+    'О': 'O', 'о': 'O',
+    'Р': 'P', 'р': 'P',
+    'Т': 'T', 'т': 'T',
+    'Х': 'X', 'х': 'X',
+    'У': 'Y', 'у': 'Y',
+}
+
+def _normalize_guard_string(s: str) -> str:
+    return ''.join(_CYRILLIC_TO_LATIN_HOMOGLYPHS.get(c, c) for c in (s or ""))
+
+def _extract_guard_code(text: str) -> str | None:
+    txt = (text or "").strip()
+    if not txt:
+        return None
+    clean_pure = re.sub(r'[^A-Za-z0-9]', '', txt).upper()
+    if len(clean_pure) == 5:
+        return clean_pure
+    norm_txt = _normalize_guard_string(txt)
+    clean_norm = re.sub(r'[^A-Za-z0-9]', '', norm_txt).upper()
+    if len(clean_norm) == 5:
+        return clean_norm
+    ignore_tokens = {
+        "STEAM", "GUARD", "ENTER", "HELLO", "CHECK", "LOGIN", "RESET", "AGAIN",
+        "READY", "START", "ADMIN", "TOKEN", "ORDER", "EMAIL", "PHONE", "CLICK"
+    }
+    tokens = re.findall(r'\b([A-Za-z0-9]{5})\b', norm_txt)
+    valid_tokens = [t.upper() for t in tokens if t.upper() not in ignore_tokens]
+    if len(valid_tokens) == 1:
+        return valid_tokens[0]
+    kw_match = re.search(r'(?:код(?:ик)?|code|guard)[\s:=#\-]+([A-Za-z0-9]{5})\b', norm_txt, re.IGNORECASE)
+    if kw_match:
+        return kw_match.group(1).upper()
+    return None
+def _clean_funpay_text(text: str) -> str:
+    s = re.sub(r'<[^>]+>', '', text)
+    s = html.unescape(s)
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+def _send_buyer_fp_msg(cardinal, chat_id, text: str, buyer_username: str | None = None) -> bool:
+    card = cardinal or cardinal_instance
+    acc = getattr(card, 'account', None) if card else None
+    if not acc:
+        logger.error(f"[{NAME}] send_message: аккаунт Cardinal недоступен")
+        return False
+    cid = chat_id
+    bname = buyer_username if (buyer_username and buyer_username != "?") else None
+    if (cid is None or str(cid).strip() in ("", "?")) and bname:
+        try:
+            chat = acc.get_chat_by_name(bname, True)
+            if chat:
+                cid = int(chat.id)
+        except Exception as e:
+            logger.warning(f"[{NAME}] get_chat_by_name({bname}): {e}")
+    if cid is None:
+        logger.error(f"[{NAME}] Нет chat_id для отправки сообщения покупателю {buyer_username}")
+        return False
+    target_cids = [cid]
+    if isinstance(cid, str) and cid.isdigit():
+        target_cids = [int(cid), cid]
+    clean_text = _clean_funpay_text(text)
+    for attempt in range(3):
+        for target in target_cids:
+            try:
+                if card and hasattr(card, "send_message"):
+                    res = card.send_message(target, clean_text, chat_name=bname, watermark=False)
+                    if res is not None:
+                        return True
+                else:
+                    acc.send_message(target, clean_text, chat_name=bname)
+                    return True
+            except Exception as e:
+                logger.warning(f"[{NAME}] Ошибка отправки сообщения в FunPay (target={target}, попытка {attempt + 1}): {e}")
+                time.sleep(0.5)
+        if attempt == 0 and bname:
+            try:
+                chat = acc.get_chat_by_name(bname, True)
+                if chat and getattr(chat, 'id', None):
+                    new_cid = int(chat.id)
+                    if new_cid not in target_cids:
+                        target_cids.insert(0, new_cid)
+            except Exception:
+                pass
+        time.sleep(1)
+    return False
+def _try_refund(cardinal, order_id: str | int) -> bool:
+    acc = getattr(cardinal, 'account', None) if cardinal else None
+    if not acc:
+        acc = getattr(cardinal_instance, 'account', None) if cardinal_instance else None
+    if not acc:
+        logger.error(f"[{NAME}] Не удалось выполнить возврат #{order_id}: аккаунт Cardinal недоступен")
+        return False
+    try:
+        oid = str(order_id).strip()
+        if oid.startswith('#'):
+            oid = oid[1:]
+        acc.refund(oid)
+        logger.info(f"[{NAME}] Возврат средств по заказу #{oid} успешно выполнен")
+        return True
+    except Exception as e:
+        logger.error(f"[{NAME}] Ошибка возврата средств #{order_id}: {e}")
+        return False
+def _set_funpay_lot_active(cardinal, lot_id: str | int, active: bool) -> bool:
+    acc = getattr(cardinal, 'account', None) if cardinal else None
+    if not acc:
+        acc = getattr(cardinal_instance, 'account', None) if cardinal_instance else None
+    if not acc:
+        return False
+    try:
+        lf = acc.get_lot_fields(int(lot_id))
+        if getattr(lf, "active", None) == active:
+            return True
+        lf.active = bool(active)
+        renew = getattr(lf, "renew_fields", None)
+        if callable(renew):
+            renewed = renew()
+            if renewed is not None:
+                lf = renewed
+        acc.save_lot(lf)
+        logger.info(f"[{NAME}] Статус лота #{lot_id} на FunPay изменён: active={active}")
+        return True
+    except Exception as e:
+        logger.warning(f"[{NAME}] Ошибка изменения активности лота #{lot_id} на FunPay: {e}")
+        return False
+def _deactivate_funpay_lot(cardinal, lot_id: str | int) -> bool:
+    return _set_funpay_lot_active(cardinal, lot_id, False)
+
+def _delete_funpay_lot(cardinal, lot_id: str | int) -> bool:
+    acc = getattr(cardinal, 'account', None) if cardinal else None
+    if not acc:
+        acc = getattr(cardinal_instance, 'account', None) if cardinal_instance else None
+    if not acc:
+        return False
+    try:
+        lid_int = int(str(lot_id).strip().lstrip('#'))
+        if hasattr(acc, "delete_lot"):
+            acc.delete_lot(lid_int)
+        else:
+            try:
+                from FunPayAPI.types import LotFields
+                acc.save_lot(LotFields(lid_int, {"csrf_token": getattr(acc, "csrf_token", ""), "offer_id": lid_int, "deleted": "1"}))
+            except Exception:
+                acc.method("post", "https://funpay.com/lots/offerEdit", {"csrf_token": getattr(acc, "csrf_token", ""), "offer_id": lid_int, "deleted": "1"})
+        logger.info(f"[{NAME}] Лот #{lot_id} удалён с FunPay")
+        return True
+    except Exception as e:
+        logger.warning(f"[{NAME}] Ошибка удаления лота #{lot_id} с FunPay: {e}")
+        return False
+PROCESSED_ORDERS_FILE = os.path.join(STORAGE_DIR, "processed_orders.json")
+_processed_orders_list: list[str] = []
+_processed_orders: set[str] = set()
+_processed_orders_lock = threading.Lock()
+
+def _load_processed_orders() -> None:
+    global _processed_orders_list, _processed_orders
+    with _processed_orders_lock:
+        if os.path.exists(PROCESSED_ORDERS_FILE):
+            try:
+                with open(PROCESSED_ORDERS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    _processed_orders_list = [str(x).strip().lstrip('#') for x in data[-2000:] if x]
+                    _processed_orders = set(_processed_orders_list)
+            except Exception as e:
+                logger.warning(f"[{NAME}] Ошибка чтения {PROCESSED_ORDERS_FILE}: {e}")
+def _mark_order_processed(oid: str) -> None:
+    oid = str(oid).strip().lstrip('#')
+    if not oid:
+        return
+    with _processed_orders_lock:
+        if oid not in _processed_orders:
+            _processed_orders.add(oid)
+            _processed_orders_list.append(oid)
+            if len(_processed_orders_list) > 2000:
+                old = _processed_orders_list.pop(0)
+                _processed_orders.discard(old)
+            try:
+                with open(PROCESSED_ORDERS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(_processed_orders_list, f, indent=2)
+            except Exception as e:
+                logger.error(f"[{NAME}] Ошибка записи {PROCESSED_ORDERS_FILE}: {e}")
+def _is_order_processed(oid: str) -> bool:
+    oid = str(oid).strip().lstrip('#')
+    with _processed_orders_lock:
+        return oid in _processed_orders
+ORDER_PAID_RE = re.compile(r'оплатил(?:а)?\s+заказ\s*#([A-Za-z0-9]+)', re.IGNORECASE)
+_REFUND_RE = re.compile(r'(?:вернул(?:а)?\s+деньги|возврат\s+средств|отменен[оа]?|отменён[оа]?).*?#([A-Za-z0-9]+)', re.IGNORECASE)
+_CONFIRM_RE = re.compile(r'(?:подтвердил(?:а)?\s+.*?(?:заказ|завершение|выполнение).*?#([A-Za-z0-9]+)|заказ\s*#([A-Za-z0-9]+)\s*(?:подтвержден|подтверждён|закрыт|завершен|завершён))', re.IGNORECASE)
+
+_TOPUP_MARKERS = [
+    "пополнение", "пополнить", "баланс", "пополнения", "по логину",
+    "steam wallet", "кошелек steam", "кошелёк steam", "код кошелька",
+    "пополнение steam", "top-up", "topup"
+]
+_RC_EXPLICIT_MARKERS = [
+    "смена региона", "смену региона", "сменить регион",
+    "поменять регион", "перевод региона", "перевести регион",
+    "перенос региона", "change region", "region change"
+]
+
+def _normalize_title(t: str) -> str:
+    if not t:
+        return ""
+    s = str(t).strip().casefold()
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip(" \t\r\n.,;:|!?-–—")
+
+def _get_seller_profile_lots(cardinal) -> list[Any]:
+    if not cardinal:
+        return []
+    res: list[Any] = []
+    seen: set[str] = set()
+    for p_obj in (getattr(cardinal, 'profile', None), getattr(cardinal, 'curr_profile', None)):
+        if p_obj:
+            if hasattr(p_obj, 'get_sorted_lots'):
+                try:
+                    sl_dict = p_obj.get_sorted_lots(1)
+                    if isinstance(sl_dict, dict):
+                        for item in sl_dict.values():
+                            iid = str(getattr(item, 'id', '') or '')
+                            if iid and iid not in seen:
+                                seen.add(iid)
+                                res.append(item)
+                except Exception:
+                    pass
+            if hasattr(p_obj, 'get_lots'):
+                try:
+                    gl = p_obj.get_lots() or []
+                    for item in gl:
+                        iid = str(getattr(item, 'id', '') or '')
+                        if iid and iid not in seen:
+                            seen.add(iid)
+                            res.append(item)
+                except Exception:
+                    pass
+    if not res and getattr(cardinal, 'account', None):
+        try:
+            gl = cardinal.account.get_my_subcategory_lots(2044) or []
+            for item in gl:
+                iid = str(getattr(item, 'id', '') or '')
+                if iid and iid not in seen:
+                    seen.add(iid)
+                    res.append(item)
+        except Exception:
+            pass
+    return res
+
+def _find_lot_for_order(cardinal, order, event=None, order_text: str = "") -> tuple[str | None, dict[str, Any] | None, str]:
+    cfg = _load_config()
+    lots = _get_lots_dict(cfg)
+    if not lots:
+        return (None, None, "no_configured_lots")
+
+    order_id_clean = str(getattr(order, 'id', '') or getattr(event, 'order_id', '') or getattr(event, 'id', '') or '').lstrip('#').strip()
+    subcat = getattr(order, 'subcategory', None)
+    subcat_id = getattr(subcat, 'id', None) or getattr(order, 'subcategory_id', None)
+    subcat_id_clean = str(subcat_id or '2044')
+
+    objects = [x for x in (order, event) if x is not None]
+    for parent in list(objects):
+        for nested_name in ('lot', 'offer', 'lot_shortcut', 'offer_shortcut', 'node', 'fields', 'data'):
+            nested = parent.get(nested_name) if isinstance(parent, dict) else getattr(parent, nested_name, None)
+            if nested is not None and all(nested is not obj for obj in objects):
+                objects.append(nested)
+
+    candidate_lot_ids: list[str] = []
+    seen_candidates: set[str] = set()
+
+    def _add_cand(val: Any) -> None:
+        if val is None or isinstance(val, bool):
+            return
+        try:
+            s = str(val).strip()
+            if s.isdigit() and int(s) > 0:
+                if s != "2044" and s != subcat_id_clean and s != order_id_clean and s not in seen_candidates:
+                    seen_candidates.add(s)
+                    candidate_lot_ids.append(s)
+        except Exception:
+            pass
+
+    for obj in objects:
+        for name in ('lot_id', 'offer_id'):
+            v = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+            _add_cand(v)
+        if obj is not order and obj is not event:
+            v = obj.get('id') if isinstance(obj, dict) else getattr(obj, 'id', None)
+            _add_cand(v)
+
+    for obj in (order, event):
+        html_val = obj.get('html') if isinstance(obj, dict) else getattr(obj, 'html', None)
+        if isinstance(html_val, str) and html_val:
+            for m in re.finditer(r'(?:offer\?id=|data-offer=["\']|data-lot-id=["\'])(\d+)', html_val):
+                _add_cand(m.group(1))
+
+    if candidate_lot_ids:
+        for cand_id in candidate_lot_ids:
+            if cand_id in lots:
+                lcfg = lots[cand_id]
+                if not lcfg.get("enabled", True):
+                    return (None, None, f"lot_disabled_{cand_id}")
+                return (cand_id, lcfg, "direct_candidate_match")
+
+        return (None, None, f"different_lot_id_ignored_{candidate_lot_ids[0]}")
+
+    texts: list[str] = []
+    for s in [
+        getattr(order, 'short_description', None),
+        getattr(order, 'description', None),
+        getattr(order, 'title', None),
+        getattr(order, 'full_description', None),
+        getattr(order, 'subcategory_name', None),
+        order_text,
+    ]:
+        txt = str(s or '').strip()
+        if txt and txt not in texts:
+            texts.append(txt)
+    combined_texts = " ".join(texts).lower()
+
+    is_topup = any(m in combined_texts for m in _TOPUP_MARKERS) and not any(m in combined_texts for m in _RC_EXPLICIT_MARKERS)
+    if is_topup:
+        return (None, None, "topup_order_ignored")
+
+    subcat_name = str(getattr(subcat, 'name', '') or getattr(order, 'subcategory_name', '') or '').lower()
+
+    is_rc_cat = False
+    if subcat_id is not None and str(subcat_id) == "2044":
+        is_rc_cat = True
+    elif any(p in subcat_name for p in ("смена региона", "region change")):
+        is_rc_cat = True
+
+    if subcat_id is not None and str(subcat_id) != "2044" and not is_rc_cat:
+        return (None, None, "different_category_id_ignored")
+    if subcat_name and not is_rc_cat:
+        if any(other in subcat_name for other in ("пополнение", "баланс", "аккаунт", "ключ", "гифт", "gift", "wallet", "предмет", "валют")):
+            return (None, None, "different_category_name_ignored")
+
+    if not is_rc_cat and not any(m in combined_texts for m in _RC_EXPLICIT_MARKERS):
+        return (None, None, "not_region_change_order")
+
+    order_desc_candidates: list[str] = []
+    for s in [
+        getattr(order, 'short_description', None),
+        getattr(order, 'description', None),
+        getattr(order, 'title', None),
+    ]:
+        if s:
+            sc = str(s).strip()
+            if sc and sc not in order_desc_candidates:
+                order_desc_candidates.append(sc)
+
+    seller_lots = _get_seller_profile_lots(cardinal)
+
+    seller_lots.sort(key=lambda l: len(str(getattr(l, 'description', None) or getattr(l, 'title', None) or '')), reverse=True)
+
+    matched_seller_lot_id: str | None = None
+    for s_lot in seller_lots:
+        slid = str(getattr(s_lot, 'id', '') or getattr(s_lot, 'offer_id', '') or '').strip()
+        sdesc = str(getattr(s_lot, 'description', None) or getattr(s_lot, 'title', None) or '').strip()
+        if not slid or not sdesc:
+            continue
+        sdesc_norm = _normalize_title(sdesc)
+        if len(sdesc_norm) < 3:
+            continue
+
+        is_match = False
+        for odc in order_desc_candidates:
+            if _normalize_title(odc) == sdesc_norm:
+                is_match = True
+                break
+
+        if not is_match and order_text:
+            txt_norm = _normalize_title(order_text)
+            if len(sdesc_norm) >= 4 and re.search(r'(?:^|[\.,\|;\n\r])\s*' + re.escape(sdesc_norm) + r'\s*(?:$|[\.,\|;\n\r])', txt_norm):
+                is_match = True
+
+        if is_match:
+            matched_seller_lot_id = slid
+            break
+
+    if matched_seller_lot_id:
+        if matched_seller_lot_id in lots:
+            lcfg = lots[matched_seller_lot_id]
+            if not lcfg.get("enabled", True):
+                return (None, None, f"lot_disabled_{matched_seller_lot_id}")
+            return (matched_seller_lot_id, lcfg, "seller_lot_match")
+        else:
+
+            return (None, None, f"other_seller_lot_ignored_{matched_seller_lot_id}")
+
+    for lid, lcfg in lots.items():
+        ltitle = str(lcfg.get("title") or '').strip()
+        if not ltitle or ltitle.lower().startswith("лот ") or ltitle.lower().startswith("лот #"):
+            continue
+        ltitle_norm = _normalize_title(ltitle)
+        if len(ltitle_norm) < 4:
+            continue
+
+        is_match = False
+        for odc in order_desc_candidates:
+            if _normalize_title(odc) == ltitle_norm:
+                is_match = True
+                break
+
+        if not is_match and order_text:
+            txt_norm = _normalize_title(order_text)
+            if re.search(r'(?:^|[\.,\|;\n\r])\s*' + re.escape(ltitle_norm) + r'\s*(?:$|[\.,\|;\n\r])', txt_norm):
+                is_match = True
+
+        if is_match:
+            if not lcfg.get("enabled", True):
+                return (None, None, f"lot_disabled_{lid}")
+            return (lid, lcfg, "config_title_strict_match")
+
+    return (None, None, "not_configured_plugin_lot")
+
+def _process_incoming_order(cardinal, order, event=None, order_text: str = ""):
+    global cardinal_instance
+    if cardinal_instance is None:
+        cardinal_instance = cardinal
+    cfg = _load_config()
+    if not cfg.get("plugin_enabled", True):
+        return
+    oid = str(getattr(order, 'id', '') or getattr(event, 'order_id', '') or getattr(event, 'id', '') or '').strip()
+    if oid.startswith('#'):
+        oid = oid[1:]
+    if not oid:
+        return
+    if _is_order_processed(oid):
+        return
+    buyer_name = str(
+        getattr(order, 'buyer_username', None)
+        or getattr(event, 'buyer_username', None)
+        or getattr(event, 'user_name', None)
+        or '?'
+    ).strip()
+    buyer_id = (
+        getattr(order, 'buyer_id', None)
+        or getattr(event, 'buyer_id', None)
+        or getattr(event, 'user_id', None)
+    )
+    desc_sample = str(getattr(order, 'description', None) or order_text or '')[:100]
+    _log_event("order_received", order_id=oid, buyer=buyer_name, desc=desc_sample)
+    lot_id, lot_cfg, match_reason = _find_lot_for_order(cardinal, order, event, order_text)
+    if not lot_id or not lot_cfg:
+        _log_event("order_miss", level=logging.INFO, order_id=oid, reason=match_reason, configured_lots=list(_get_lots_dict(cfg).keys()))
+        return
+    country = lot_cfg.get("country", "KZ")
+    _log_event("order_matched", order_id=oid, lot_id=lot_id, method=match_reason, country=country)
+    if not lot_cfg.get("enabled", False):
+        _log_event("lot_disabled", level=logging.WARNING, order_id=oid, lot_id=lot_id)
+        return
+    chat_id = getattr(order, 'chat_id', None) or getattr(event, 'chat_id', None)
+    if not chat_id and getattr(cardinal, 'account', None):
+        try:
+            full_ord = cardinal.account.get_order(oid)
+            chat_id = getattr(full_ord, 'chat_id', None)
+            if not buyer_name or buyer_name == '?':
+                buyer_name = str(getattr(full_ord, 'buyer_username', '?') or '?')
+            if not buyer_id:
+                buyer_id = getattr(full_ord, 'buyer_id', None)
+        except Exception as e:
+            logger.warning(f"[{NAME}] get_order({oid}) fallback: {e}")
+    if (not chat_id or not str(chat_id).isdigit()) and buyer_name and buyer_name != '?' and getattr(cardinal, 'account', None):
+        try:
+            chat = cardinal.account.get_chat_by_name(buyer_name, True)
+            if chat and getattr(chat, 'id', None):
+                chat_id = chat.id
+        except Exception as e:
+            logger.debug(f"[{NAME}] get_chat_by_name({buyer_name}) fallback: {e}")
+    if not chat_id:
+        _log_event("order_no_chat_id", level=logging.WARNING, order_id=oid, lot_id=lot_id)
+        return
+    country_name = _country_display(country)
+    proxies = list(lot_cfg.get("proxies") or [])
+    if not proxies:
+        _mark_order_processed(oid)
+        _log_event("order_rejected", level=logging.WARNING, order_id=oid, lot_id=lot_id, reason="no_proxies")
+        if cfg.get("auto_deactivate_lots", True):
+            lot_cfg["enabled"] = False
+            cfg["lots"][str(lot_id)] = lot_cfg
+            _save_config(cfg)
+            _deactivate_funpay_lot(cardinal, lot_id)
+            _log_event("lot_auto_deactivated", level=logging.WARNING, lot_id=lot_id, reason="proxy_pool_empty")
+        refund_enabled = should_refund(FailureReason.PROXY_EXHAUSTED, order_id=oid)
+        refund_ok = False
+        if refund_enabled:
+            refund_ok = _try_refund(cardinal, oid)
+            _log_event("refund_result", order_id=oid, reason=FailureReason.PROXY_EXHAUSTED, success=refund_ok)
+        if refund_ok:
+            ref_status_str = "✅ выполнен"
+        elif not refund_enabled:
+            ref_status_str = "❌ отключён в настройках"
+        else:
+            ref_status_str = "❌ сбой выполнения автовозврата"
+        msg_key = "no_proxies_refund" if refund_ok else "no_proxies_no_refund"
+        _send_buyer_fp_msg(cardinal, chat_id, _render_buyer_msg(msg_key, order_id=oid, country_name=country_name), buyer_username=buyer_name)
+        _log_event("order_refund", level=logging.WARNING, order_id=oid, reason="no_proxies", refund_ok=refund_ok)
+        _notify_tg(
+            f"🚨 <b>Нет рабочих прокси</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Регион: {country_name}\n"
+            f"Причина: закончились рабочие прокси\n\n"
+            f"Проверено прокси: 0\n"
+            f"Рабочих: 0\n\n"
+            f"Возврат: {ref_status_str}",
+            ntype="error"
+        )
+        return
+    qr_mode = _get_qr_mode(cfg)
+    sess = {
+        "order_id": oid,
+        "buyer_username": buyer_name,
+        "buyer_id": buyer_id,
+        "lot_id": str(lot_id),
+        "lot_cfg": lot_cfg,
+        "login_mode": qr_mode,
+        "cancel_qr_event": threading.Event(),
+        "chat_id": chat_id,
+        "country": country,
+        "proxies": proxies,
+        "created_at": time.time(),
+    }
+
+    if qr_mode == "choice":
+        sess["step"] = "waiting_choice"
+        _register_buyer_session(sess, buyer_id=buyer_id)
+        _mark_order_processed(oid)
+        msg = _render_buyer_msg("welcome_menu", country_name=country_name, order_id=oid, buyer_username=buyer_name)
+        if not msg:
+            msg = _render_buyer_msg("welcome_qr_choice", country_name=country_name, order_id=oid, buyer_username=buyer_name)
+        _send_buyer_fp_msg(cardinal, chat_id, msg, buyer_username=buyer_name)
+        _log_event("order_welcome_menu_sent", order_id=oid, chat_id=chat_id, mode="choice")
+        _notify_tg(
+            f"🛒 <b>Новый заказ #{oid}</b>\n\n"
+            f"• Покупатель: <b>{buyer_name}</b>\n"
+            f"• Лот: <b>#{lot_id}</b> ({country_name})\n"
+            f"• Режим входа: <b>{_qr_mode_label(qr_mode)}</b> (ожидаем выбор 1 или 2)",
+            ntype="order"
+        )
+        return
+    elif qr_mode == "qr_only":
+        sess["step"] = "waiting_qr_ready"
+        _register_buyer_session(sess, buyer_id=buyer_id)
+        _mark_order_processed(oid)
+        msg = _render_buyer_msg("qr_ready_prompt", country_name=country_name, order_id=oid, buyer_username=buyer_name)
+        if not msg:
+            msg = _render_buyer_msg("welcome_qr_only", country_name=country_name, order_id=oid, buyer_username=buyer_name)
+        _send_buyer_fp_msg(cardinal, chat_id, msg, buyer_username=buyer_name)
+        _log_event("order_qr_ready_prompt_sent", order_id=oid, chat_id=chat_id, mode="qr_only")
+        _notify_tg(
+            f"🛒 <b>Новый заказ #{oid}</b>\n\n"
+            f"• Покупатель: <b>{buyer_name}</b>\n"
+            f"• Лот: <b>#{lot_id}</b> ({country_name})\n"
+            f"• Режим входа: <b>{_qr_mode_label(qr_mode)}</b> (ожидаем готовность «+»)",
+            ntype="order"
+        )
+        return
+
+    sess["step"] = "waiting_login"
+    sess["login_wait_time"] = time.time()
+    _register_buyer_session(sess, buyer_id=buyer_id)
+    _mark_order_processed(oid)
+    welcome_text = _render_buyer_msg(
+        "welcome",
+        country_name=country_name,
+        order_id=oid,
+        buyer_username=buyer_name,
+        login=""
+    )
+    sent_ok = _send_buyer_fp_msg(cardinal, chat_id, welcome_text, buyer_username=buyer_name)
+    if sent_ok:
+        _log_event("order_welcome_sent", order_id=oid, chat_id=chat_id, country=country)
+    else:
+        _log_event("order_welcome_error", level=logging.ERROR, order_id=oid, chat_id=chat_id)
+    _notify_tg(
+        f"🛒 <b>Новый заказ #{oid}</b>\n\n"
+        f"• Покупатель: <b>{buyer_name}</b>\n"
+        f"• Лот: <b>#{lot_id}</b> ({country_name})\n"
+        f"• Статус: <b>Шаг 1 из 2</b> (ожидаем логин Steam)",
+        ntype="order"
+    )
+def handle_new_order(cardinal, event, *args):
+    order = getattr(event, 'order', None) or event
+    oid = str(getattr(order, 'id', '') or getattr(event, 'order_id', '') or getattr(event, 'id', '') or '').strip().lstrip('#')
+    key = f"incoming:{oid}" if oid else f"incoming:event:{id(event)}"
+    serial_key = _event_chat_key(event, order)
+    if not _schedule_event_job(key, _run_serialized_event, serial_key, _process_incoming_order, cardinal, order, event):
+        _log_event("order_event_busy", level=logging.DEBUG, order_id=oid or "?")
+_recent_processed_msgs: dict[tuple[str, str], float] = {}
+_processed_msgs_lock = threading.Lock()
+
+def _handle_new_message_impl(cardinal, event, *args):
+    global cardinal_instance
+    if cardinal_instance is None:
+        cardinal_instance = cardinal
+    cfg = _load_config()
+    if not cfg.get("plugin_enabled", True):
+        return
+    chat_obj = getattr(event, 'chat', None)
+    message_obj = getattr(event, 'message', None)
+    my_id = getattr(getattr(cardinal, 'account', None), 'id', None)
+    if chat_obj is not None:
+        if getattr(chat_obj, 'last_by_bot', False):
+            return
+        chat_id = getattr(chat_obj, 'id', None)
+        chat_name = getattr(chat_obj, 'name', None)
+        author = chat_name
+        author_id = None
+        msg_text = str(getattr(chat_obj, 'last_message_text', '') or '').strip()
+    elif message_obj is not None:
+        if getattr(message_obj, 'by_bot', False):
+            return
+        author_id = getattr(message_obj, 'author_id', None)
+        if my_id is not None and author_id is not None and str(author_id) == str(my_id):
+            return
+        chat_id = getattr(message_obj, 'chat_id', None)
+        chat_name = getattr(message_obj, 'chat_name', None) or getattr(event, 'chat_name', None)
+        author = getattr(message_obj, 'author', None) or getattr(message_obj, 'author_name', None)
+        msg_text = str(getattr(message_obj, 'text', '') or getattr(message_obj, 'content', '') or '').strip()
+    else:
+        if getattr(event, 'by_bot', False) or getattr(event, 'last_by_bot', False):
+            return
+        author_id = getattr(event, 'author_id', None)
+        if my_id is not None and author_id is not None and str(author_id) == str(my_id):
+            return
+        chat_id = getattr(event, 'chat_id', None) or getattr(event, 'id', None)
+        chat_name = getattr(event, 'chat_name', None) or getattr(event, 'name', None)
+        author = getattr(event, 'author', None) or getattr(event, 'author_name', None)
+        msg_text = str(getattr(event, 'text', '') or getattr(event, 'last_message_text', '') or getattr(event, 'content', '') or '').strip()
+    if not msg_text:
+        return
+    msg_id = (
+        getattr(message_obj, 'id', None)
+        or getattr(chat_obj, 'node_msg_id', None)
+        or getattr(chat_obj, 'user_msg_id', None)
+    )
+    dedup_key = (str(chat_id or '?'), str(msg_id) if msg_id else msg_text)
+    now_ts = time.time()
+    with _processed_msgs_lock:
+        old_k = [k for k, t in _recent_processed_msgs.items() if (now_ts - t) > 60]
+        for k in old_k:
+            _recent_processed_msgs.pop(k, None)
+        if dedup_key in _recent_processed_msgs and (now_ts - _recent_processed_msgs[dedup_key]) < 10.0:
+            return
+        _recent_processed_msgs[dedup_key] = now_ts
+    author_str = str(author or '').strip().lower()
+    chat_name_str = str(chat_name or '').strip().lower()
+    msg_low = msg_text.lower()
+
+    m_ref = _REFUND_RE.search(msg_text)
+    if m_ref:
+        ref_oid = m_ref.group(1).strip()
+        logger.info(f"[{NAME}] Обнаружено сообщение о возврате средств по заказу #{ref_oid}")
+        _terminate_buyer_session(ref_oid, reason="chat_refund_notice", chat_id=chat_id)
+        return
+
+    m_conf = _CONFIRM_RE.search(msg_text)
+    if m_conf:
+        conf_oid = next((g for g in m_conf.groups() if g), "").strip()
+        if conf_oid:
+            logger.info(f"[{NAME}] Обнаружено сообщение о подтверждении/закрытии заказа #{conf_oid}")
+            _terminate_buyer_session(conf_oid, reason="chat_confirm_notice", chat_id=chat_id)
+            return
+
+    is_system_msg = (
+        author_str in ('funpay', 'system', 'фанпей')
+        or chat_name_str in ('funpay', 'system')
+        or msg_text.startswith('FunPay:')
+        or 'оплатил заказ #' in msg_low
+        or 'оплатила заказ #' in msg_low
+        or 'подтвердить выполнение заказа' in msg_low
+        or 'вернул деньги' in msg_low
+        or 'возврат средств' in msg_low
+        or 'служба поддержки funpay' in msg_low
+    )
+    m = ORDER_PAID_RE.search(msg_text)
+    if m:
+        if any(w in msg_low for w in _TOPUP_MARKERS) and not any(w in msg_low for w in _RC_EXPLICIT_MARKERS):
+            _log_event("order_msg_ignored_topup", text=msg_text[:120])
+            return
+        oid = m.group(1).strip()
+        with _processed_orders_lock:
+            already = oid in _processed_orders
+        if not already:
+            _log_event("order_msg_fallback", order_id=oid, text=msg_text[:120])
+            def _fallback_order_job():
+                full_ord = None
+                if getattr(cardinal, 'account', None):
+                    try:
+                        full_ord = cardinal.account.get_order(oid)
+                    except Exception as e:
+                        logger.warning(f"[{NAME}] Fallback get_order({oid}): {e}")
+                order_obj = full_ord or SimpleNamespace(id=oid, chat_id=chat_id, description=msg_text, buyer_username=chat_name or author)
+                _process_incoming_order(cardinal, order_obj, event=event, order_text=msg_text)
+            _schedule_event_job(f"incoming:{oid}", _run_serialized_event, _event_chat_key(event), _fallback_order_job)
+        return
+    if is_system_msg:
+        sess_chk = _find_buyer_session(chat_id=chat_id, chat_name=chat_name, author=author, author_id=author_id)
+        if sess_chk:
+            chk_oid = str(sess_chk.get("order_id", "")).strip().lstrip('#')
+            if any(w in msg_low for w in ('вернул', 'возврат', 'подтвердил', 'закрыт', 'отменен', 'отменён')):
+                _terminate_buyer_session(chk_oid, reason="chat_system_msg_closure", chat_id=chat_id)
+        return
+    sess = _find_buyer_session(
+        chat_id=chat_id,
+        chat_name=chat_name,
+        author=author,
+        author_id=author_id
+    )
+    if not sess:
+        return
+    oid = str(sess.get("order_id", "")).strip().lstrip('#')
+    with _terminated_orders_lock:
+        if oid in _terminated_orders:
+            _terminate_buyer_session(oid, reason="terminated_order_filter", chat_id=chat_id)
+            return
+
+    if chat_id is not None:
+        sess["chat_id"] = chat_id
+    if author_id is not None and not sess.get("buyer_id"):
+        sess["buyer_id"] = author_id
+    country_name = _country_display(sess.get("country", "KZ"))
+    step = sess.get("step")
+    raw_txt = msg_text.strip()
+    raw_low = raw_txt.lower()
+
+    if raw_low in ("заново", "-", "отмена", "start", "/start", "назад", "reset", "сначала"):
+        sess["canceled"] = True
+        _cancel_qr_worker(oid, reason="user_session_reset")
+        cancel_evt = sess.get("cancel_qr_event")
+        if cancel_evt and isinstance(cancel_evt, threading.Event):
+            cancel_evt.set()
+        guard_evt = sess.get("guard_event")
+        if guard_evt and isinstance(guard_evt, threading.Event):
+            guard_evt.set()
+        sess.pop("canceled", None)
+        sess["cancel_qr_event"] = _get_or_create_qr_cancel_event(oid)
+        sess.pop("login", None)
+        sess.pop("password", None)
+        sess.pop("guard_code", None)
+        login_mode = sess.get("login_mode", "choice")
+        if login_mode == "choice":
+            sess["step"] = "waiting_choice"
+            _register_buyer_session(sess)
+            msg = _render_buyer_msg("welcome_menu", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username"))
+            if not msg:
+                msg = _render_buyer_msg("welcome_qr_choice", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username"))
+            _send_buyer_fp_msg(cardinal, chat_id, f"🔄 Сессия сброшена.\n\n{msg}", buyer_username=sess.get("buyer_username"))
+            _log_event("order_session_reset", order_id=oid, mode="choice")
+            return
+        elif login_mode == "qr_only":
+            sess["step"] = "waiting_qr_ready"
+            _register_buyer_session(sess)
+            msg = _render_buyer_msg("qr_ready_prompt", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username"))
+            if not msg:
+                msg = _render_buyer_msg("welcome_qr_only", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username"))
+            _send_buyer_fp_msg(cardinal, chat_id, f"🔄 Сессия сброшена.\n\n{msg}", buyer_username=sess.get("buyer_username"))
+            _log_event("order_session_reset", order_id=oid, mode="qr_only")
+            return
+        else:
+            sess["step"] = "waiting_login"
+            sess["login_wait_time"] = time.time()
+            sess.pop("reminded_login", None)
+            sess.pop("reminded_login_time", None)
+            _register_buyer_session(sess)
+            msg = _render_buyer_msg("welcome", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username"))
+            _send_buyer_fp_msg(cardinal, chat_id, f"🔄 Сессия сброшена.\n\n{msg}", buyer_username=sess.get("buyer_username"))
+            _log_event("order_session_reset", order_id=oid, mode="login")
+            return
+
+    if step == "waiting_choice":
+        creds = _extract_creds_from_text(msg_text)
+        if creds:
+            _cancel_qr_worker(oid, reason="creds_from_choice_menu")
+            sess["login"], sess["password"] = creds
+            sess["step"] = "processing"
+            _register_buyer_session(sess)
+            ack_msg = _render_buyer_msg("data_received", login=creds[0], country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, ack_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_creds_received_from_menu", order_id=oid, login=creds[0])
+            _notify_tg(
+                f"⏳ <b>Заказ #{oid} взят в работу (вход по логину)</b>\n\n"
+                f"• Покупатель: <b>{sess.get('buyer_username', '?')}</b>\n"
+                f"• Логин Steam: <code>{creds[0]}</code>\n"
+                f"• Целевой регион: <b>{country_name}</b>",
+                ntype="order"
+            )
+            _schedule_order_worker(cardinal, sess, "login")
+            return
+
+        if raw_low in ("1", "1️⃣", "логин", "login", "пароль", "pass", "данные"):
+            _cancel_qr_worker(oid, reason="choice_login_selected")
+            sess["step"] = "waiting_login"
+            sess["login_wait_time"] = time.time()
+            sess.pop("reminded_login", None)
+            sess.pop("reminded_login_time", None)
+            _register_buyer_session(sess)
+            w_msg = _render_buyer_msg("welcome", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, w_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_choice_login_selected", order_id=oid)
+            return
+
+        if raw_low in ("2", "2️⃣", "qr", "кьюар", "кьюар код", "код", "qr код"):
+            sess["step"] = "waiting_qr_ready"
+            _register_buyer_session(sess)
+            q_msg = _render_buyer_msg("qr_ready_prompt", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            if not q_msg:
+                q_msg = _render_buyer_msg("welcome_qr_only", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, q_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_choice_qr_selected", order_id=oid)
+            return
+
+        if raw_low in ("+", "++", "готов", "го", "давай", "сканирую"):
+            _cancel_qr_worker(oid, reason="menu_qr_start")
+            cancel_evt = _get_or_create_qr_cancel_event(oid)
+            sess["cancel_qr_event"] = cancel_evt
+            sess["step"] = "waiting_qr"
+            _register_buyer_session(sess)
+            _send_buyer_fp_msg(cardinal, chat_id, "🔄 Генерируем QR-код для входа...", buyer_username=sess.get("buyer_username"))
+            _log_event("order_qr_started_from_menu_plus", order_id=oid)
+            _schedule_order_worker(cardinal, sess, "qr")
+            return
+
+        if _is_valid_steam_login(raw_txt) and len(raw_txt) >= 3:
+            _cancel_qr_worker(oid, reason="login_from_choice_menu")
+            sess["login"] = raw_txt
+            sess["step"] = "waiting_password"
+            sess["login_time"] = time.time()
+            _register_buyer_session(sess)
+            ask_pwd = _render_buyer_msg("ask_password", login=raw_txt, country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, ask_pwd, buyer_username=sess.get("buyer_username"))
+            _log_event("order_login_received_from_menu", order_id=oid, login=raw_txt)
+            return
+
+        hint = (
+            "Пожалуйста, выберите способ авторизации:\n\n"
+            "1️⃣ По Логину и Паролю — напишите цифру 1\n"
+            "2️⃣ По QR-коду — напишите цифру 2\n\n"
+            "ℹ️ Если что-то пошло не так — напишите «заново» или «-», чтобы сбросить выбор."
+        )
+        _send_buyer_fp_msg(cardinal, chat_id, hint, buyer_username=sess.get("buyer_username"))
+        return
+
+    elif step == "waiting_qr_ready":
+        creds = _extract_creds_from_text(msg_text)
+        if creds:
+            _cancel_qr_worker(oid, reason="creds_from_qr_ready")
+            sess["login"], sess["password"] = creds
+            sess["step"] = "processing"
+            _register_buyer_session(sess)
+            ack_msg = _render_buyer_msg("data_received", login=creds[0], country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, ack_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_creds_received_from_qr_ready", order_id=oid, login=creds[0])
+            _notify_tg(
+                f"⏳ <b>Заказ #{oid} взят в работу (вход по логину)</b>\n\n"
+                f"• Покупатель: <b>{sess.get('buyer_username', '?')}</b>\n"
+                f"• Логин Steam: <code>{creds[0]}</code>\n"
+                f"• Целевой регион: <b>{country_name}</b>",
+                ntype="order"
+            )
+            _schedule_order_worker(cardinal, sess, "login")
+            return
+
+        if raw_low in ("+", "++", "готов", "го", "давай", "сканирую", "2", "2️⃣", "qr", "кьюар"):
+            _cancel_qr_worker(oid, reason="qr_ready_start")
+            cancel_evt = _get_or_create_qr_cancel_event(oid)
+            sess["cancel_qr_event"] = cancel_evt
+            sess["step"] = "waiting_qr"
+            _register_buyer_session(sess)
+            _send_buyer_fp_msg(cardinal, chat_id, "🔄 Генерируем QR-код для входа...", buyer_username=sess.get("buyer_username"))
+            _log_event("order_qr_started_after_ready", order_id=oid)
+            _schedule_order_worker(cardinal, sess, "qr")
+            return
+
+        if raw_low in ("1", "1️⃣", "логин", "пароль"):
+            _cancel_qr_worker(oid, reason="switched_from_qr_ready_to_login")
+            sess["step"] = "waiting_login"
+            sess["login_wait_time"] = time.time()
+            sess.pop("reminded_login", None)
+            sess.pop("reminded_login_time", None)
+            _register_buyer_session(sess)
+            w_msg = _render_buyer_msg("welcome", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, w_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_switched_from_qr_ready_to_login", order_id=oid)
+            return
+
+        if _is_valid_steam_login(raw_txt) and len(raw_txt) >= 3:
+            _cancel_qr_worker(oid, reason="login_from_qr_ready")
+            sess["login"] = raw_txt
+            sess["step"] = "waiting_password"
+            sess["login_time"] = time.time()
+            _register_buyer_session(sess)
+            ask_pwd = _render_buyer_msg("ask_password", login=raw_txt, country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, ask_pwd, buyer_username=sess.get("buyer_username"))
+            _log_event("order_login_received_from_qr_ready", order_id=oid, login=raw_txt)
+            return
+
+        hint = (
+            "📷 Ожидаем вашей готовности к сканированию QR-кода.\n\n"
+            "Как только откроете мобильное приложение Steam (Steam Guard → Сканер) — отправьте «+» (плюс) в этот чат для получения QR-кода.\n"
+            "(Или отправьте «1», чтобы войти по логину и паролю)"
+        )
+        _send_buyer_fp_msg(cardinal, chat_id, hint, buyer_username=sess.get("buyer_username"))
+        return
+
+    elif step in ("waiting_qr", "waiting_qr_timeout", "waiting_qr_or_creds"):
+        if raw_low in ("+", "++", "2", "2️⃣", "qr", "кьюар", "код", "обновить qr", "новый qr", "еще qr", "ещё qr", "готов", "давай"):
+            _cancel_qr_worker(oid, reason="new_qr_requested")
+            cancel_evt = _get_or_create_qr_cancel_event(oid)
+            sess["cancel_qr_event"] = cancel_evt
+            sess["step"] = "waiting_qr"
+            _register_buyer_session(sess)
+            _send_buyer_fp_msg(cardinal, chat_id, "🔄 Генерируем новый QR-код для входа...", buyer_username=sess.get("buyer_username"))
+            _log_event("order_qr_requested_new", order_id=oid)
+            _schedule_order_worker(cardinal, sess, "qr")
+            return
+
+        creds = _extract_creds_from_text(msg_text)
+        if creds:
+            _cancel_qr_worker(oid, reason="creds_from_qr")
+            sess["login"], sess["password"] = creds
+            sess["step"] = "processing"
+            _register_buyer_session(sess)
+            ack_msg = _render_buyer_msg(
+                "data_received",
+                login=creds[0],
+                country_name=country_name,
+                order_id=oid,
+                buyer_username=sess.get("buyer_username", "")
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, ack_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_creds_received_from_qr", order_id=oid, login=creds[0])
+            _notify_tg(
+                f"⏳ <b>Заказ #{oid} взят в работу (вход по логину)</b>\n\n"
+                f"• Покупатель: <b>{sess.get('buyer_username', '?')}</b>\n"
+                f"• Логин Steam: <code>{creds[0]}</code>\n"
+                f"• Целевой регион: <b>{country_name}</b>",
+                ntype="order"
+            )
+            _schedule_order_worker(cardinal, sess, "login")
+            return
+
+        if raw_low in ("1", "1️⃣", "логин", "пароль"):
+            _cancel_qr_worker(oid, reason="switched_from_qr_to_login")
+            sess["step"] = "waiting_login"
+            sess["login_wait_time"] = time.time()
+            sess.pop("reminded_login", None)
+            sess.pop("reminded_login_time", None)
+            _register_buyer_session(sess)
+            w_msg = _render_buyer_msg("welcome", country_name=country_name, order_id=oid, buyer_username=sess.get("buyer_username", ""))
+            _send_buyer_fp_msg(cardinal, chat_id, w_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_switched_from_qr_to_login", order_id=oid)
+            return
+
+        login_val = raw_txt
+        if _is_valid_steam_login(login_val) and len(login_val) >= 3 and raw_low not in ("qr", "help"):
+            _cancel_qr_worker(oid, reason="login_from_qr")
+            sess["login"] = login_val
+            sess["step"] = "waiting_password"
+            sess["login_time"] = time.time()
+            _register_buyer_session(sess)
+            ask_pwd = _render_buyer_msg(
+                "ask_password",
+                login=login_val,
+                country_name=country_name,
+                order_id=oid,
+                buyer_username=sess.get("buyer_username", "")
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, ask_pwd, buyer_username=sess.get("buyer_username"))
+            _log_event("order_login_received_from_qr", order_id=oid, login=login_val)
+            return
+
+        if step == "waiting_qr":
+            hint_msg = (
+                "📱 Бот ожидает подтверждения входа через QR-код в мобильном приложении Steam.\n\n"
+                "• Чтобы получить новый QR-код, отправьте: «+» или «qr»\n"
+                "• Чтобы войти по логину и паролю, отправьте «1» (или данные «логин:пароль»)\n"
+                "• Напишите «заново» или «-», чтобы начать сначала"
+            )
+        else:
+            hint_msg = (
+                "⏳ Время действия QR-кода истекло.\n\n"
+                "• Чтобы получить новый QR-код, отправьте «+» или «2»\n"
+                "• Чтобы войти по логину и паролю, отправьте «1» (или данные «логин:пароль»)\n"
+                "• Напишите «заново» или «-», чтобы начать сначала"
+            )
+        _send_buyer_fp_msg(cardinal, chat_id, hint_msg, buyer_username=sess.get("buyer_username"))
+        return
+
+    elif step in ("waiting_login", "waiting_credentials"):
+        creds = _extract_creds_from_text(msg_text)
+        if creds:
+            sess["login"], sess["password"] = creds
+            sess["step"] = "processing"
+            _register_buyer_session(sess)
+            ack_msg = _render_buyer_msg(
+                "data_received",
+                login=creds[0],
+                country_name=country_name,
+                order_id=oid,
+                buyer_username=sess.get("buyer_username", "")
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, ack_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_creds_received", order_id=oid, login=creds[0])
+            _notify_tg(
+                f"⏳ <b>Заказ #{oid} взят в работу</b>\n\n"
+                f"• Покупатель: <b>{sess.get('buyer_username', '?')}</b>\n"
+                f"• Логин Steam: <code>{creds[0]}</code>\n"
+                f"• Целевой регион: <b>{country_name}</b>",
+                ntype="order"
+            )
+            _schedule_order_worker(cardinal, sess, "login")
+        else:
+            login_val = msg_text.strip()
+            if not _is_valid_steam_login(login_val):
+                _log_event("order_invalid_login_format", level=logging.INFO, order_id=oid, text=login_val[:30])
+                warn_msg = (
+                    "⚠️ <b>Некорректный логин Steam!</b>\n\n"
+                    "Логин должен содержать только латинские буквы, цифры и символы без пробелов (например: <code>my_login</code>).\n"
+                    "Пожалуйста, отправьте правильный логин (или сразу <code>логин:пароль</code>):"
+                )
+                _send_buyer_fp_msg(cardinal, chat_id, warn_msg, buyer_username=sess.get("buyer_username"))
+                return
+            sess["login"] = login_val
+            sess["step"] = "waiting_password"
+            sess["login_time"] = time.time()
+            _register_buyer_session(sess)
+            ask_pwd = _render_buyer_msg(
+                "ask_password",
+                login=login_val,
+                country_name=country_name,
+                order_id=oid,
+                buyer_username=sess.get("buyer_username", "")
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, ask_pwd, buyer_username=sess.get("buyer_username"))
+            _log_event("order_login_received", order_id=oid, login=login_val)
+    elif step == "waiting_password":
+        pwd_val = msg_text.strip()
+        curr_login = sess.get("login", "")
+        if curr_login and pwd_val.strip().lower() == curr_login.strip().lower():
+            _log_event("order_ignoring_repeated_login", level=logging.DEBUG, order_id=oid, login=curr_login)
+            return
+        if curr_login and pwd_val.startswith(f"{curr_login}:"):
+            sess["password"] = pwd_val[len(curr_login) + 1:].strip()
+        elif ":" in pwd_val:
+            parts = pwd_val.split(":", 1)
+            p0, p1 = parts[0].strip(), parts[1].strip()
+            if _is_valid_steam_login(p0) and p1:
+                sess["login"], sess["password"] = p0, p1
+            else:
+                sess["password"] = pwd_val
+        elif "\n" in pwd_val:
+            lines = [l.strip() for l in pwd_val.splitlines() if l.strip()]
+            if len(lines) >= 2 and _is_valid_steam_login(lines[0]) and lines[1]:
+                sess["login"], sess["password"] = lines[0], lines[1]
+            else:
+                sess["password"] = pwd_val
+        else:
+            sess["password"] = pwd_val
+        if not sess.get("password"):
+            return
+        login_val = sess.get("login", "")
+        sess["step"] = "processing"
+        _register_buyer_session(sess)
+        ack_msg = _render_buyer_msg(
+            "data_received",
+            login=login_val,
+            country_name=country_name,
+            order_id=oid,
+            buyer_username=sess.get("buyer_username", "")
+        )
+        _send_buyer_fp_msg(cardinal, chat_id, ack_msg, buyer_username=sess.get("buyer_username"))
+        _log_event("order_password_received", order_id=oid, login=login_val)
+        _notify_tg(
+            f"⏳ <b>Заказ #{oid} взят в работу</b>\n\n"
+            f"• Покупатель: <b>{sess.get('buyer_username', '?')}</b>\n"
+            f"• Логин Steam: <code>{login_val}</code>\n"
+            f"• Целевой регион: <b>{country_name}</b>",
+            ntype="order"
+        )
+        _schedule_order_worker(cardinal, sess, "login")
+    elif step == "waiting_push":
+        code = _extract_guard_code(msg_text)
+        if code:
+            sess["guard_code"] = code
+            _register_buyer_session(sess)
+            _send_buyer_fp_msg(
+                cardinal,
+                chat_id,
+                "✅ Код Steam Guard получен! Проверяем его...",
+                buyer_username=sess.get("buyer_username"),
+            )
+            _log_event("order_guard_push_code_entered", order_id=oid, code="***")
+        else:
+            push_hint = _render_buyer_msg(
+                "guard_push",
+                login=sess.get("login", ""),
+                order_id=oid,
+                buyer_username=sess.get("buyer_username", ""),
+                country_name=country_name,
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, push_hint, buyer_username=sess.get("buyer_username"))
+    elif step == "waiting_guard":
+        guard_event = sess.get("guard_event")
+        code = _extract_guard_code(msg_text)
+        if code:
+            sess["guard_code"] = code
+            _log_event("order_guard_entered", order_id=oid, code="***")
+            ack_guard = _render_buyer_msg(
+                "guard_received",
+                order_id=oid,
+                country_name=country_name,
+                login=sess.get("login", ""),
+                buyer_username=sess.get("buyer_username", "")
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, ack_guard, buyer_username=sess.get("buyer_username"))
+            if guard_event and isinstance(guard_event, threading.Event):
+                guard_event.set()
+        else:
+            hint_msg = (
+                f"⚠️ Пожалуйста, введите 5-значный проверочный код Steam Guard (например: 2XY8Z).\n\n"
+                f"Вы отправили «{msg_text.strip()[:25]}», в котором не найден 5-значный проверочный код. Бот продолжает ожидать корректный код Steam Guard."
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, hint_msg, buyer_username=sess.get("buyer_username"))
+            _log_event("order_guard_non_code_msg", level=logging.INFO, order_id=oid, text=msg_text.strip()[:25])
+    elif step == "paused_silent":
+        txt = msg_text.strip()
+        creds = _extract_creds_from_text(txt)
+        code = _extract_guard_code(txt)
+        if creds:
+            sess["login"], sess["password"] = creds
+            sess["step"] = "processing"
+            _register_buyer_session(sess)
+            _send_buyer_fp_msg(cardinal, chat_id, f"✅ Данные приняты! Возобновляем выполнение заказа #{oid}...", buyer_username=sess.get("buyer_username"))
+            _schedule_order_worker(cardinal, sess, "login")
+        elif code:
+            sess["guard_code"] = code
+            sess["step"] = "processing"
+            _register_buyer_session(sess)
+            _send_buyer_fp_msg(cardinal, chat_id, f"✅ Код Steam Guard принят! Возобновляем выполнение заказа #{oid}...", buyer_username=sess.get("buyer_username"))
+            _schedule_order_worker(cardinal, sess, "login")
+        elif not sess.get("login") and _is_valid_steam_login(txt):
+            sess["login"] = txt
+            sess["step"] = "waiting_password"
+            sess["login_time"] = time.time()
+            _register_buyer_session(sess)
+            ask_pwd = _render_buyer_msg(
+                "ask_password",
+                login=txt,
+                country_name=country_name,
+                order_id=oid,
+                buyer_username=sess.get("buyer_username", "")
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, ask_pwd, buyer_username=sess.get("buyer_username"))
+        elif sess.get("login") and not sess.get("password") and txt:
+            sess["password"] = txt
+            sess["step"] = "processing"
+            _register_buyer_session(sess)
+            _send_buyer_fp_msg(cardinal, chat_id, f"✅ Пароль принят! Возобновляем выполнение заказа #{oid}...", buyer_username=sess.get("buyer_username"))
+            _schedule_order_worker(cardinal, sess, "login")
+        elif sess.get("login") and sess.get("password"):
+            hint_msg = (
+                f"⚠️ Заказ #{oid} ожидает ввода проверочного кода Steam Guard.\n\n"
+                f"Пожалуйста, отправьте 5-значный проверочный код (например: 2XY8Z) или новые данные в формате «логин:пароль»."
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, hint_msg, buyer_username=sess.get("buyer_username"))
+        else:
+            hint_msg = (
+                f"⚠️ Заказ #{oid} ожидает ввода данных для входа в Steam.\n\n"
+                f"Пожалуйста, отправьте логин и пароль в формате «логин:пароль» (или отдельно логин)."
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, hint_msg, buyer_username=sess.get("buyer_username"))
+
+def handle_new_message(cardinal, event, *args):
+    serial_key = _event_chat_key(event)
+    event_id = _message_event_identity(event)
+    job_key = f"message:{serial_key}:{event_id}"
+    if not _schedule_event_job(job_key, _run_serialized_event, serial_key, _handle_new_message_impl, cardinal, event, *args):
+        _log_event("message_event_busy", level=logging.DEBUG, chat=serial_key, event_id=event_id)
+
+def classify_failure_reason(res: Optional[AccountRegionResult], proxy_pool: Optional[ProxyPool] = None, err_text: str = "") -> str:
+    if res and getattr(res, "failure_reason", None):
+        return res.failure_reason
+    err_low = (str(res.error or "") if res else str(err_text)).lower()
+    if "покупк" in err_low or "purchase" in err_low:
+        return FailureReason.ACCOUNT_PURCHASED
+    if "пополнен" in err_low or "кошел" in err_low or "баланс" in err_low or "wallet" in err_low:
+        return FailureReason.ACCOUNT_FUNDED
+    if "ключ" in err_low or "retail" in err_low or "cd key" in err_low or "cd-key" in err_low:
+        return FailureReason.ACCOUNT_KEY_ACTIVATED
+    if res and res.status == RegionResult.SKIP_FIXED:
+        return FailureReason.REGION_FIXED
+    if res and res.status == RegionResult.FAIL_VERIFY_REGION:
+        return FailureReason.VERIFY_FAILED
+    if res and res.status == RegionResult.FAIL_WRONG_PASS:
+        return FailureReason.WRONG_CREDENTIALS
+    if res and res.status == RegionResult.FAIL_WRONG_GUARD:
+        return FailureReason.WRONG_GUARD
+    if (res and res.status == RegionResult.FAIL_RATE_LIMIT) or "ratelimit" in err_low or "429" in err_low or "code': 84" in err_low:
+        return FailureReason.STEAM_RATE_LIMIT
+    if (res and res.status == RegionResult.FAIL_TEMP_ERROR) or any(kw in err_low for kw in ("500", "502", "503", "504", "temporary unavailable", "server disconnected")):
+        return FailureReason.STEAM_TEMP_ERROR
+    if (proxy_pool is not None and len(proxy_pool) == 0) or "закончились рабочие прокси" in err_low or "нет рабочего прокси" in err_low or "отсутствуют рабочие прокси" in err_low:
+        return FailureReason.PROXY_EXHAUSTED
+    if "timeout" in err_low and ("qr" in err_low or (res and getattr(res, "login", "") == "(qr)")):
+        return FailureReason.QR_TIMEOUT
+    return FailureReason.UNKNOWN
+
+def finish_failed_order(
+    cardinal,
+    sess: dict[str, Any],
+    effective_reason: str,
+    error_text: str = "",
+    mode: str = "login",
+    proxy_pool: Optional[ProxyPool] = None,
+    refund_enabled: Optional[bool] = None,
+) -> None:
+    oid = str(sess.get("order_id", "")).strip().lstrip('#')
+    login = str(sess.get("login") or "").strip()
+    chat_id = sess.get("chat_id")
+    buyer_user = sess.get("buyer_username", "")
+    country = sess.get("country", "KZ")
+    country_name = _country_display(country)
+
+    _log_event("order_failure_classified", order_id=oid, reason=effective_reason, mode=mode)
+
+    if refund_enabled is None:
+        refund_enabled = should_refund(effective_reason, order_id=oid)
+
+    refund_ok = False
+    if refund_enabled:
+        refund_ok = _try_refund(cardinal, oid)
+        _log_event("refund_result", order_id=oid, reason=effective_reason, success=refund_ok)
+        ref_status_str = "✅ выполнен" if refund_ok else "❌ сбой выполнения автовозврата"
+    else:
+        ref_status_str = "❌ отключён в настройках"
+
+    st = _load_stats()
+    st["failed"] = st.get("failed", 0) + 1
+    _save_stats(st)
+    sess["step"] = "failed"
+
+    res_gift = sess.get("reserved_gift")
+    if res_gift:
+        _release_gift_code(res_gift)
+
+    fail_reason = error_text.strip() or f"Steam отклонил смену региона на {country_name}"
+    if effective_reason == FailureReason.ACCOUNT_PURCHASED:
+        fail_msg = _render_buyer_msg("account_purchased_refund" if refund_ok else "account_purchased_no_refund", order_id=oid, login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.ACCOUNT_FUNDED:
+        fail_msg = _render_buyer_msg("fixed_wallet_refund" if refund_ok else "fixed_wallet_no_refund", order_id=oid, login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.ACCOUNT_KEY_ACTIVATED:
+        fail_msg = _render_buyer_msg("key_activated_refund" if refund_ok else "key_activated_no_refund", order_id=oid, login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.REGION_FIXED:
+        fail_msg = _render_buyer_msg("fixed_wallet_refund" if refund_ok else "fixed_wallet_no_refund", order_id=oid, login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.PROXY_EXHAUSTED:
+        fail_msg = _render_buyer_msg("no_proxies_refund" if refund_ok else "no_proxies_no_refund", order_id=oid, country_name=country_name)
+    elif effective_reason == FailureReason.CHECK_FAILED:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason="Не удалось получить необходимые страницы Steam для проверки аккаунта", login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.STEAM_TEMP_ERROR:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason="Временная ошибка серверов Steam", login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.STEAM_RATE_LIMIT:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason="Временное ограничение запросов Steam (Rate Limit)", login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.VERIFY_FAILED:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason="Смена региона не подтверждена страницами Steam", login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.USER_TIMEOUT:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason="Время ожидания ответа покупателя истекло", login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.WRONG_CREDENTIALS:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason="Неверный логин или пароль Steam", login=login, buyer_username=buyer_user)
+    elif effective_reason == FailureReason.WRONG_GUARD:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason="Неверный или просроченный код Steam Guard", login=login, buyer_username=buyer_user)
+    else:
+        fail_msg = _render_buyer_msg("error_refund" if refund_ok else "error_no_refund", order_id=oid, reason=fail_reason, login=login, buyer_username=buyer_user)
+
+    _send_buyer_fp_msg(cardinal, chat_id, fail_msg, buyer_username=buyer_user)
+    _log_event("order_result", level=logging.WARNING, order_id=oid, login=login, refund_ok=refund_ok, reason=effective_reason, detail=fail_reason, mode=mode)
+
+    mode_suffix = " (QR)" if mode == "qr" else ""
+    if effective_reason == FailureReason.ACCOUNT_PURCHASED:
+        tg_msg = (
+            f"🛒 <b>Аккаунт не подходит{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Причина:\n"
+            f"На аккаунте обнаружены покупки Steam.\n\n"
+            f"Смена не выполнялась.\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.ACCOUNT_FUNDED:
+        tg_msg = (
+            f"💰 <b>Аккаунт не подходит{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Причина:\n"
+            f"Обнаружено пополнение Steam Wallet.\n\n"
+            f"Смена не выполнялась.\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.ACCOUNT_KEY_ACTIVATED:
+        tg_msg = (
+            f"🔑 <b>Аккаунт не подходит{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Причина:\n"
+            f"Обнаружена активация Steam-ключа.\n\n"
+            f"Смена не выполнялась.\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.REGION_FIXED:
+        tg_msg = (
+            f"⚠️ <b>Регион уже закреплён{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Причина:\n"
+            f"Кошелёк Steam уже зафиксирован на другом регионе.\n\n"
+            f"Смена не выполнялась.\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.PROXY_EXHAUSTED:
+        tested_cnt = proxy_pool.total_configured if proxy_pool is not None else len(sess.get("proxies") or [])
+        tg_msg = (
+            f"🚨 <b>Нет рабочих прокси</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Регион: {country_name}\n\n"
+            f"Проверено прокси: {tested_cnt}\n"
+            f"Доступных: 0\n\n"
+            f"Причина:\n"
+            f"Все прокси завершились ошибками подключения.\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.CHECK_FAILED:
+        tg_msg = (
+            f"⚠️ <b>Не удалось проверить Steam-аккаунт{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Не удалось получить необходимые страницы Steam.\n\n"
+            f"Смена региона не выполнялась.\n"
+            f"Возврат: {ref_status_str}.\n\n"
+            f"Нужна ручная проверка."
+        )
+    elif effective_reason == FailureReason.VERIFY_FAILED:
+        tg_msg = (
+            f"❌ <b>Смена региона не подтверждена{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Регион: {country_name}\n\n"
+            f"Причина:\n"
+            f"Финальная проверка региона не прошла (страницы Steam не подтвердили смену региона).\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.STEAM_TEMP_ERROR:
+        tg_msg = (
+            f"⚠️ <b>Временная ошибка Steam{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Причина:\n"
+            f"Серверы Steam временно недоступны (5xx / disconnected).\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.STEAM_RATE_LIMIT:
+        tg_msg = (
+            f"⏳ <b>Ограничение запросов Steam{mode_suffix}</b>\n\n"
+            f"Заказ: #{oid}\n"
+            f"Логин: <code>{login or 'не указан'}</code>\n\n"
+            f"Причина:\n"
+            f"Steam временно ограничил запросы (HTTP 429 / code 84).\n\n"
+            f"Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.USER_TIMEOUT:
+        tg_msg = (
+            f"⏱ <b>Заказ #{oid} отменён по таймауту{mode_suffix}</b>\n\n"
+            f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+            f"• Логин Steam: <code>{login or 'не указан'}</code>\n"
+            f"• Причина: покупатель не ответил вовремя.\n\n"
+            f"• Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.WRONG_CREDENTIALS:
+        tg_msg = (
+            f"❌ <b>Заказ #{oid} отменён (неверный пароль)</b>\n\n"
+            f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+            f"• Логин Steam: <code>{login or 'не указан'}</code>\n"
+            f"• Причина: неверный логин или пароль Steam.\n\n"
+            f"• Возврат: {ref_status_str}"
+        )
+    elif effective_reason == FailureReason.WRONG_GUARD:
+        tg_msg = (
+            f"❌ <b>Заказ #{oid} отменён (неверный Guard)</b>\n\n"
+            f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+            f"• Логин Steam: <code>{login or 'не указан'}</code>\n"
+            f"• Причина: неверный или просроченный код Steam Guard.\n\n"
+            f"• Возврат: {ref_status_str}"
+        )
+    else:
+        tg_msg = (
+            f"⚠️ <b>Заказ #{oid} не выполнен{mode_suffix}</b>\n\n"
+            f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+            f"• Логин Steam: <code>{login or 'не указан'}</code>\n"
+            f"• Причина: {fail_reason}\n\n"
+            f"• Возврат: {ref_status_str}"
+        )
+
+    _notify_tg(tg_msg, ntype="error")
+
+    _cancel_qr_worker(oid, reason=f"finished_failed_{effective_reason}")
+    _terminate_buyer_session(oid, reason=f"finish_failed_order_{effective_reason}", chat_id=chat_id)
+
+def _run_qr_order_process(cardinal, sess):
+    chat_id = sess["chat_id"]
+    country = sess["country"]
+    proxies = sess.get("proxies") or _load_proxies()
+    lot_id = sess.get("lot_id")
+    oid = str(sess.get("order_id", ""))
+    buyer_user = sess.get("buyer_username", "")
+    country_name = _country_display(country)
+    cfg = _load_config()
+    cancel_evt = _get_or_create_qr_cancel_event(oid)
+    sess["cancel_qr_event"] = cancel_evt
+    _log_event("qr_worker_started", order_id=oid, chat_id=chat_id)
+
+    if not proxies:
+        if cfg.get("auto_deactivate_lots", True) and lot_id:
+            _deactivate_funpay_lot(cardinal, lot_id)
+            lots = _get_lots_dict(cfg)
+            if str(lot_id) in lots:
+                lots[str(lot_id)]["enabled"] = False
+                cfg["lots"] = lots
+                _save_config(cfg)
+        finish_failed_order(
+            cardinal,
+            sess,
+            effective_reason=FailureReason.PROXY_EXHAUSTED,
+            error_text="У лота отсутствуют рабочие прокси",
+            mode="qr",
+            proxy_pool=None,
+        )
+        return
+
+    _log_event("order_qr_start", order_id=oid, lot_id=lot_id, country=country)
+    reserved_gift = None
+
+    async def _async_qr_worker():
+        nonlocal reserved_gift
+        proxy_pool = ProxyPool(proxies)
+        gift_pool = None
+        if cfg.get("auto_redeem_gift", True):
+            reserved_gift = _reserve_gift_code()
+            if reserved_gift:
+                gift_pool = GiftCodePool([reserved_gift], per_account=1)
+                logger.info(f"[QR #{oid}] Зарезервирован гифт-код {_mask_gift_code(reserved_gift)}")
+
+        displayed = False
+        async def _display_cb(challenge_url: str):
+            nonlocal displayed
+            if displayed or cancel_evt.is_set():
+                return
+            displayed = True
+            qr_sent = False
+            try:
+                import qrcode
+                qr_obj = qrcode.QRCode(box_size=8, border=2)
+                qr_obj.add_data(challenge_url)
+                qr_obj.make(fit=True)
+                img = qr_obj.make_image(fill_color="black", back_color="white")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                buf.seek(0)
+                if getattr(cardinal, 'account', None) and hasattr(cardinal.account, 'send_image'):
+                    try:
+                        cardinal.account.send_image(int(chat_id), buf)
+                        qr_sent = True
+                        _log_event("order_qr_image_sent", order_id=oid, chat_id=chat_id)
+                    except Exception as e:
+                        logger.warning(f"[{NAME}] Ошибка send_image в чат #{chat_id}: {e}")
+            except Exception as e:
+                logger.warning(f"[{NAME}] Ошибка генерации QR-изображения: {e}")
+
+            msg_qr = _render_buyer_msg(
+                "welcome_qr",
+                country_name=country_name,
+                order_id=oid,
+                buyer_username=buyer_user,
+                challenge_url=challenge_url
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, msg_qr, buyer_username=buyer_user)
+            _log_event("order_qr_welcome_sent", order_id=oid, chat_id=chat_id, img_sent=qr_sent)
+
+        async def _confirmed_cb(login_name: str):
+            c_msg = _render_buyer_msg(
+                "qr_confirmed",
+                country_name=country_name,
+                order_id=oid,
+                buyer_username=buyer_user,
+                login=login_name or ""
+            )
+            if not c_msg:
+                c_msg = f"✅ Вход по QR подтверждён!\n\n⏳ Продолжаем вход в аккаунт и смену региона на {country_name}..."
+            _send_buyer_fp_msg(cardinal, chat_id, c_msg, buyer_username=buyer_user)
+            _log_event("order_qr_confirmed", order_id=oid, login=login_name)
+
+        res = await process_one_account_qr(
+            proxy_pool=proxy_pool,
+            country_code=country,
+            display_cb=_display_cb,
+            gift_pool=gift_pool,
+            poll_timeout=180.0,
+            confirmed_cb=_confirmed_cb,
+            cancel_event=cancel_evt,
+            order_id=oid,
+        )
+
+        if cancel_evt.is_set() or sess.get("canceled"):
+            if reserved_gift:
+                _release_gift_code(reserved_gift)
+            return
+
+        login = res.login or "(qr)"
+        sess["login"] = login
+
+        if reserved_gift:
+            if res.is_success and res.gift_redeemed:
+                _commit_gift_code(reserved_gift)
+                logger.info(f"[{login}] Гифт-код {_mask_gift_code(reserved_gift)} успешно активирован.")
+            else:
+                _release_gift_code(reserved_gift)
+
+        st = _load_stats()
+        st["total_operations"] = st.get("total_operations", 0) + 1
+        st["last_operation"] = f"{time.strftime('%d.%m.%Y %H:%M:%S')} (Заказ #{oid})"
+
+        if res.is_success:
+            _cancel_qr_worker(oid, reason="order_success_qr")
+            st["success"] = st.get("success", 0) + 1
+            if res.gift_redeemed:
+                st["gifts_redeemed"] = st.get("gifts_redeemed", 0) + 1
+            _save_stats(st)
+            sess["step"] = "finished"
+            success_msg = _render_buyer_msg(
+                "success",
+                country_name=country_name,
+                order_id=oid,
+                login=login,
+                buyer_username=buyer_user
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, success_msg, buyer_username=buyer_user)
+            _log_event("order_success", order_id=oid, login=login, country=country, gift=res.gift_redeemed, mode="qr")
+            gift_line = "\n• Активация гифта: 🎁 успешно" if res.gift_redeemed else ""
+            _notify_tg(
+                f"✅ <b>Заказ #{oid} успешно выполнен (QR)!</b>\n\n"
+                f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+                f"• Логин Steam: <code>{login}</code>\n"
+                f"• Новый регион: <b>{country_name}</b>"
+                f"{gift_line}",
+                ntype="success"
+            )
+            _terminate_buyer_session(oid, reason="order_success_qr", chat_id=chat_id)
+        else:
+            effective_reason = classify_failure_reason(res, proxy_pool=proxy_pool)
+            if effective_reason == FailureReason.QR_TIMEOUT:
+                refund_enabled = should_refund(FailureReason.QR_TIMEOUT, order_id=oid)
+                if not refund_enabled:
+                    sess["step"] = "waiting_qr_timeout"
+                    sess["timeout_qr_time"] = time.time()
+                    _register_buyer_session(sess)
+                    t_msg = _render_buyer_msg(
+                        "qr_timeout",
+                        order_id=oid,
+                        country_name=country_name,
+                        buyer_username=buyer_user,
+                        login=login,
+                    )
+                    _send_buyer_fp_msg(cardinal, chat_id, t_msg, buyer_username=buyer_user)
+                    _log_event("order_qr_timeout", order_id=oid, login=login)
+                    _notify_tg(
+                        f"⏱ <b>Заказ #{oid} · Время действия QR-кода истекло</b>\n\n"
+                        f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+                        f"• Статус: бот ожидает ввода «+» / «2» для повтора или «1» для логина.",
+                        ntype="order"
+                    )
+                    return
+                else:
+                    finish_failed_order(
+                        cardinal,
+                        sess,
+                        effective_reason=effective_reason,
+                        error_text=str(res.error or ""),
+                        mode="qr",
+                        proxy_pool=proxy_pool,
+                        refund_enabled=True,
+                    )
+                    return
+
+            finish_failed_order(
+                cardinal,
+                sess,
+                effective_reason=effective_reason,
+                error_text=str(res.error or ""),
+                mode="qr",
+                proxy_pool=proxy_pool,
+            )
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_async_qr_worker())
+    except Exception as e:
+        logger.error(f"[{NAME}] Order processing QR error: {e}", exc_info=True)
+        if reserved_gift:
+            _release_gift_code(reserved_gift)
+        try:
+            _send_buyer_fp_msg(
+                cardinal, chat_id,
+                "❌ Произошла ошибка при формировании сессии QR. Вы можете отправить логин и пароль в этот чат («логин:пароль»).",
+                buyer_username=buyer_user
+            )
+        except Exception:
+            pass
+        _notify_tg(
+            f"❌ <b>Критическая ошибка QR заказа #{oid}</b>\n\n"
+            f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+            f"• Ошибка: <code>{html.escape(str(e)[:250])}</code>",
+            ntype="error"
+        )
+    finally:
+        _log_event("qr_worker_finished", order_id=oid)
+        loop.close()
+
+def _run_order_process(cardinal, sess):
+    chat_id = sess["chat_id"]
+    login = sess["login"]
+    password = sess["password"]
+    country = sess["country"]
+    proxies = sess.get("proxies") or _load_proxies()
+    lot_id = sess.get("lot_id")
+    oid = str(sess.get("order_id", ""))
+    buyer_user = sess.get("buyer_username", "")
+    cfg = _load_config()
+    country_name = _country_display(country)
+    if not proxies:
+        if cfg.get("auto_deactivate_lots", True) and lot_id:
+            _deactivate_funpay_lot(cardinal, lot_id)
+            lots = _get_lots_dict(cfg)
+            if str(lot_id) in lots:
+                lots[str(lot_id)]["enabled"] = False
+                cfg["lots"] = lots
+                _save_config(cfg)
+        finish_failed_order(
+            cardinal,
+            sess,
+            effective_reason=FailureReason.PROXY_EXHAUSTED,
+            error_text="У лота отсутствуют рабочие прокси",
+            mode="login",
+            proxy_pool=None,
+        )
+        return
+    _log_event("order_start", order_id=oid, lot_id=lot_id, login=login, country=country)
+    reserved_gift = None
+    async def _async_worker():
+        nonlocal reserved_gift
+        proxy_pool = ProxyPool(proxies)
+        gift_pool = None
+        if cfg.get("auto_redeem_gift", True):
+            reserved_gift = _reserve_gift_code()
+            if reserved_gift:
+                gift_pool = GiftCodePool([reserved_gift], per_account=1)
+                logger.info(f"[{login}] Для заказа #{oid} зарезервирован гифт-код {_mask_gift_code(reserved_gift)}")
+            else:
+                logger.warning(f"[{login}] В пуле нет свободных гифт-кодов для авто-активации")
+        guard_call_count = 0
+        async def _guard_cb(login_str: str, guard_type: str = "guard", guard_detail: str = "", is_retry: bool = False) -> str:
+            nonlocal guard_call_count
+            if guard_type == "push_code":
+                return str(sess.pop("guard_code", "") or "").strip().upper()
+            if guard_type == "push_code_invalid":
+                sess.pop("guard_code", None)
+                sess["step"] = "waiting_push"
+                _register_buyer_session(sess)
+                retry_msg = _render_buyer_msg(
+                    "guard_retry",
+                    login=login,
+                    order_id=oid,
+                    buyer_username=buyer_user,
+                    guard_destination="📱 Откройте раздел Steam Guard в мобильном приложении и возьмите новый 5-значный код.",
+                    country_name=_country_display(country),
+                )
+                _send_buyer_fp_msg(cardinal, chat_id, retry_msg, buyer_username=buyer_user)
+                _log_event("order_guard_push_code_rejected", order_id=oid, login=login)
+                return ""
+            guard_call_count += 1
+            if guard_type == "push":
+                sess.pop("guard_code", None)
+                sess["step"] = "waiting_push"
+                _register_buyer_session(sess)
+                push_msg = _render_buyer_msg(
+                    "guard_push",
+                    login=login,
+                    order_id=oid,
+                    buyer_username=buyer_user,
+                    country_name=_country_display(country),
+                )
+                _send_buyer_fp_msg(cardinal, chat_id, push_msg, buyer_username=buyer_user)
+                _log_event("order_guard_push_requested", order_id=oid, login=login)
+                return ""
+            sess["step"] = "waiting_guard"
+            sess.pop("guard_code", None)
+            sess["guard_event"] = threading.Event()
+            _register_buyer_session(sess)
+            if guard_type == "email":
+                hint_domain = f" (@{guard_detail})" if guard_detail and "@" not in guard_detail else (f" ({guard_detail})" if guard_detail else "")
+                dest_str = f"📧 Проверочный код отправлен на вашу почту{hint_domain}."
+            elif guard_type == "device":
+                dest_str = "📱 Откройте мобильное приложение Steam Guard и посмотрите 5-значный проверочный код."
+            else:
+                dest_str = "На ваш мобильный Guard или почту отправлен проверочный код."
+            msg_key = "guard_retry" if (is_retry or guard_call_count > 1) else "guard_request"
+            req_msg = _render_buyer_msg(
+                msg_key,
+                login=login,
+                order_id=oid,
+                buyer_username=buyer_user,
+                guard_destination=dest_str,
+                country_name=_country_display(country),
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, req_msg, buyer_username=buyer_user)
+            _log_event("order_guard_requested", order_id=oid, login=login, attempt=guard_call_count, guard_type=guard_type)
+            remind_enabled = cfg.get("buyer_inactivity_reminders", True)
+            if remind_enabled:
+                got = await asyncio.get_event_loop().run_in_executor(None, lambda: sess["guard_event"].wait(timeout=90))
+                if not got:
+                    _log_event("order_guard_reminder_sent", order_id=oid, login=login)
+                    remind_msg = _render_buyer_msg("reminder_guard", login=login, order_id=oid, buyer_username=buyer_user, country_name=_country_display(country))
+                    _send_buyer_fp_msg(cardinal, chat_id, remind_msg, buyer_username=buyer_user)
+                    got = await asyncio.get_event_loop().run_in_executor(None, lambda: sess["guard_event"].wait(timeout=180))
+                    if not got:
+                        _send_buyer_fp_msg(
+                            cardinal, chat_id,
+                            f"⏳ Мы всё ещё ожидаем код Steam Guard для заказа #{oid}.\n\n"
+                            f"Пожалуйста, проверьте мобильное приложение Steam или почту и отправьте проверочный код в этот чат.",
+                            buyer_username=buyer_user
+                        )
+                        got = await asyncio.get_event_loop().run_in_executor(None, lambda: sess["guard_event"].wait(timeout=330))
+                if sess.get("canceled"):
+                    return ""
+                if got:
+                    code = sess.get("guard_code", "")
+                    sess["step"] = "processing"
+                    _log_event("order_guard_received", order_id=oid, login=login)
+                    return code
+                if sess.get("canceled"):
+                    return ""
+                sess["step"] = "paused_silent"
+                sess["is_silent_guard"] = True
+                _log_event("order_guard_timeout_silent", level=logging.WARNING, order_id=oid, login=login)
+                return ""
+            else:
+                got = await asyncio.get_event_loop().run_in_executor(None, lambda: sess["guard_event"].wait(timeout=600))
+                if sess.get("canceled"):
+                    return ""
+                if got:
+                    code = sess.get("guard_code", "")
+                    sess["step"] = "processing"
+                    _log_event("order_guard_received", order_id=oid, login=login)
+                    return code
+                if sess.get("canceled"):
+                    return ""
+                sess["step"] = "failed"
+                _log_event("order_guard_timeout", level=logging.WARNING, order_id=oid, login=login)
+                return ""
+        sem = asyncio.Semaphore(1)
+        res = await process_one_account(
+            login=login,
+            password=password,
+            shared_secret=None,
+            proxy_pool=proxy_pool,
+            country_code=country,
+            semaphore=sem,
+            gift_pool=gift_pool,
+            guard_provider=_guard_cb,
+        )
+        if sess.get("canceled"):
+            if reserved_gift:
+                _release_gift_code(reserved_gift)
+            logger.info(f"[{NAME}] Заказ #{oid} был сброшен/отменён покупателем, прерываем выполнение.")
+            return
+        if reserved_gift:
+            if res.is_success and res.gift_redeemed:
+                _commit_gift_code(reserved_gift)
+                logger.info(f"[{login}] Гифт-код {_mask_gift_code(reserved_gift)} успешно активирован и списан.")
+            else:
+                _release_gift_code(reserved_gift)
+                logger.info(f"[{login}] Гифт-код {_mask_gift_code(reserved_gift)} возвращён в пул (активация не состоялась).")
+        st = _load_stats()
+        st["total_operations"] = st.get("total_operations", 0) + 1
+        st["last_operation"] = f"{time.strftime('%d.%m.%Y %H:%M:%S')} (Заказ #{oid})"
+        if cfg.get("auto_deactivate_lots", True) and lot_id:
+            cfg_curr = _load_config()
+            lots_curr = _get_lots_dict(cfg_curr)
+            lot_entry = lots_curr.get(str(lot_id)) or {}
+            cfg_proxies = list(lot_entry.get("proxies") or [])
+            should_deactivate = False
+            deact_reason = ""
+            if len(cfg_proxies) == 0:
+                should_deactivate = True
+                deact_reason = "У лота отсутствуют привязанные прокси."
+            elif len(proxy_pool) == 0:
+                alive_found = 0
+                for p in cfg_proxies:
+                    try:
+                        ok, _ = await check_proxy(p, timeout=5.0)
+                        if ok:
+                            alive_found += 1
+                            break
+                    except Exception:
+                        pass
+                if alive_found == 0:
+                    should_deactivate = True
+                    deact_reason = "Все прокси лота недоступны при проверке."
+                else:
+                    logger.info(f"[{NAME}] Лот #{lot_id} НЕ деактивирован: найдены доступные прокси в пуле лота.")
+            if should_deactivate:
+                _log_event("lot_auto_deactivated", level=logging.WARNING, lot_id=lot_id, reason=deact_reason)
+                _deactivate_funpay_lot(cardinal, lot_id)
+                if str(lot_id) in lots_curr:
+                    lots_curr[str(lot_id)]["enabled"] = False
+                    cfg_curr["lots"] = lots_curr
+                    _save_config(cfg_curr)
+                if bot_instance and admin_chat_id:
+                    _tg_send(admin_chat_id, f"🛑 <b>Лот #{lot_id} деактивирован на FunPay</b>\n{deact_reason}")
+        if res.is_success:
+            st["success"] = st.get("success", 0) + 1
+            if res.gift_redeemed:
+                st["gifts_redeemed"] = st.get("gifts_redeemed", 0) + 1
+            _save_stats(st)
+            sess["step"] = "finished"
+            success_msg = _render_buyer_msg(
+                "success",
+                country_name=_country_display(country),
+                order_id=oid,
+                login=login,
+                buyer_username=buyer_user
+            )
+            _send_buyer_fp_msg(cardinal, chat_id, success_msg, buyer_username=buyer_user)
+            _log_event("order_success", order_id=oid, login=login, country=country, gift=res.gift_redeemed)
+            gift_line = "\n• Активация гифта: 🎁 успешно" if res.gift_redeemed else ""
+            _notify_tg(
+                f"✅ <b>Заказ #{oid} успешно выполнен!</b>\n\n"
+                f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+                f"• Логин Steam: <code>{login}</code>\n"
+                f"• Новый регион: <b>{_country_display(country)}</b>"
+                f"{gift_line}",
+                ntype="success"
+            )
+            _cancel_qr_worker(oid, reason="order_success_login")
+            _terminate_buyer_session(oid, reason="login_order_success", chat_id=chat_id)
+        else:
+            if sess.get("is_silent_guard") and cfg.get("buyer_inactivity_reminders", True):
+                refund_enabled = should_refund(FailureReason.USER_TIMEOUT, order_id=oid)
+                if refund_enabled:
+                    finish_failed_order(
+                        cardinal,
+                        sess,
+                        effective_reason=FailureReason.USER_TIMEOUT,
+                        error_text="Время ожидания ответа покупателя истекло",
+                        mode="login",
+                        proxy_pool=proxy_pool,
+                        refund_enabled=True,
+                    )
+                    return
+                else:
+                    sess["step"] = "paused_silent"
+                    _register_buyer_session(sess)
+                    pause_msg = (
+                        f"⏳ Время ожидания кода Steam Guard истекло.\n\n"
+                        f"Заказ #{oid} ожидает вашего ответа. Как только вы отправите проверочный код или данные в этот чат — бот продолжит смену региона."
+                    )
+                    _send_buyer_fp_msg(cardinal, chat_id, pause_msg, buyer_username=buyer_user)
+                    _log_event("order_paused_silent", order_id=oid, login=login)
+                    _notify_tg(
+                        f"⏳ <b>Заказ #{oid} ожидает покупателя</b>\n\n"
+                        f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+                        f"• Логин Steam: <code>{login}</code>\n"
+                        f"• Статус: покупатель не ввёл код Steam Guard вовремя.\n"
+                        f"• <b>Автовозврат НЕ оформлен</b> (включена опция напоминания при молчании).",
+                        ntype="order"
+                    )
+                    return
+
+            if res.status == RegionResult.FAIL_WRONG_PASS:
+                refund_enabled = should_refund(FailureReason.WRONG_CREDENTIALS, order_id=oid)
+                if refund_enabled:
+                    finish_failed_order(
+                        cardinal,
+                        sess,
+                        effective_reason=FailureReason.WRONG_CREDENTIALS,
+                        error_text="Неверный логин или пароль Steam",
+                        mode="login",
+                        proxy_pool=proxy_pool,
+                        refund_enabled=True,
+                    )
+                    return
+                else:
+                    sess["step"] = "waiting_credentials"
+                    sess.pop("password", None)
+                    sess["cred_time"] = time.time()
+                    _register_buyer_session(sess)
+                    wrong_pwd_msg = (
+                        f"❌ <b>Неверный логин или пароль Steam для аккаунта «{login}»!</b>\n\n"
+                        f"Пожалуйста, проверьте введённые данные и отправьте правильные в этот чат в формате:\n"
+                        f"<code>логин:пароль</code>\n"
+                        f"(или отдельно логин, а затем пароль)."
+                    )
+                    _send_buyer_fp_msg(cardinal, chat_id, wrong_pwd_msg, buyer_username=buyer_user)
+                    _log_event("order_wrong_password_prompt", order_id=oid, login=login)
+                    _notify_tg(
+                        f"⚠️ <b>Заказ #{oid} · Неверный логин или пароль</b>\n\n"
+                        f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+                        f"• Логин: <code>{login}</code>\n"
+                        f"• Статус: бот запросил корректные данные у покупателя (без автовозврата).",
+                        ntype="order"
+                    )
+                    return
+
+            if res.status == RegionResult.FAIL_WRONG_GUARD:
+                finish_failed_order(
+                    cardinal,
+                    sess,
+                    effective_reason=FailureReason.WRONG_GUARD,
+                    error_text="Неверный или просроченный код Steam Guard",
+                    mode="login",
+                    proxy_pool=proxy_pool,
+                )
+                return
+
+            effective_reason = classify_failure_reason(res, proxy_pool, str(res.error or ""))
+
+            finish_failed_order(
+                cardinal,
+                sess,
+                effective_reason=effective_reason,
+                error_text=str(res.error or ""),
+                mode="login",
+                proxy_pool=proxy_pool,
+            )
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_async_worker())
+    except Exception as e:
+        logger.error(f"[{NAME}] Order processing error: {e}", exc_info=True)
+        if reserved_gift:
+            _release_gift_code(reserved_gift)
+        try:
+            _send_buyer_fp_msg(
+                cardinal, chat_id,
+                "❌ Произошла непредвиденная ошибка при смене региона. Продавец уведомлен и решит проблему в ближайшее время.",
+                buyer_username=buyer_user
+            )
+        except Exception:
+            pass
+        _notify_tg(
+            f"❌ <b>Критическая ошибка заказа #{oid}</b>\n\n"
+            f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+            f"• Исключение: <code>{html.escape(str(e)[:250])}</code>",
+            ntype="error"
+        )
+        _terminate_buyer_session(oid, reason="worker_exception", chat_id=chat_id)
+    finally:
+        loop.close()
+_stop_inactivity_watcher = threading.Event()
+
+def _handle_user_inactivity_timeout(cardinal, sess: dict[str, Any], step: str) -> None:
+    oid = str(sess.get("order_id", "")).strip().lstrip('#')
+    chat_id = sess.get("chat_id")
+    buyer_user = sess.get("buyer_username", "")
+    login = sess.get("login", "")
+
+    _log_event("user_inactivity_timeout", order_id=oid, step=step)
+
+    refund_enabled = should_refund(FailureReason.USER_TIMEOUT, order_id=oid)
+    if refund_enabled:
+        finish_failed_order(
+            cardinal,
+            sess,
+            effective_reason=FailureReason.USER_TIMEOUT,
+            error_text="Время ожидания ответа покупателя истекло",
+            mode="login",
+            refund_enabled=True,
+        )
+    else:
+        sess["step"] = "paused_silent"
+        _register_buyer_session(sess)
+        pause_msg = (
+            f"⏳ Время ожидания ответа истекло.\n\n"
+            f"Заказ #{oid} ожидает вашего ответа. Как только вы отправите необходимые данные в этот чат — бот продолжит смену региона."
+        )
+        _send_buyer_fp_msg(cardinal, chat_id, pause_msg, buyer_username=buyer_user)
+        _log_event("order_paused_silent", order_id=oid, login=login, step=step)
+        _notify_tg(
+            f"⏳ <b>Заказ #{oid} ожидает покупателя</b>\n\n"
+            f"• Покупатель: <b>{buyer_user or '?'}</b>\n"
+            f"• Логин Steam: <code>{login or 'не указан'}</code>\n"
+            f"• Статус: покупатель не ответил вовремя ({step}).\n"
+            f"• <b>Автовозврат НЕ оформлен</b> (включена опция напоминания при молчании).",
+            ntype="order"
+        )
+
+def _inactivity_watcher_loop(cardinal):
+    while not _stop_inactivity_watcher.is_set():
+        try:
+            if _stop_inactivity_watcher.wait(timeout=30):
+                break
+            cfg = _load_config()
+            if not cfg.get("plugin_enabled", True) or not cfg.get("buyer_inactivity_reminders", True):
+                continue
+            now = time.time()
+            with _sessions_lock:
+                sessions_snapshot = list(_active_sessions)
+            for sess in sessions_snapshot:
+                step = sess.get("step")
+                oid = str(sess.get("order_id", "")).strip().lstrip('#')
+                with _terminated_orders_lock:
+                    if oid in _terminated_orders:
+                        continue
+                if step in ("finished", "refunded", "failed_closed"):
+                    continue
+                chat_id = sess.get("chat_id")
+                buyer_user = sess.get("buyer_username", "")
+                country_name = _country_display(sess.get("country", "KZ"))
+                login = sess.get("login", "")
+                if step == "waiting_login":
+                    login_wait_at = sess.get("login_wait_time", sess.get("created_at", now))
+                    if not sess.get("reminded_login"):
+                        if (now - login_wait_at) >= 180:
+                            sess["reminded_login"] = True
+                            sess["reminded_login_time"] = now
+                            _register_buyer_session(sess)
+                            msg = _render_buyer_msg(
+                                "reminder_login",
+                                order_id=oid,
+                                buyer_username=buyer_user,
+                                country_name=country_name,
+                                login=login
+                            )
+                            _send_buyer_fp_msg(cardinal, chat_id, msg, buyer_username=buyer_user)
+                            _log_event("inactivity_reminder_sent", order_id=oid, step=step)
+                    else:
+                        rem_time = sess.get("reminded_login_time", login_wait_at + 180)
+                        if (now - rem_time) >= 180:
+                            _handle_user_inactivity_timeout(cardinal, sess, step)
+                elif step == "waiting_password":
+                    login_at = sess.get("login_time", now)
+                    if not sess.get("reminded_password"):
+                        if (now - login_at) >= 120:
+                            sess["reminded_password"] = True
+                            sess["reminded_password_time"] = now
+                            _register_buyer_session(sess)
+                            msg = _render_buyer_msg(
+                                "reminder_password",
+                                order_id=oid,
+                                buyer_username=buyer_user,
+                                country_name=country_name,
+                                login=login
+                            )
+                            _send_buyer_fp_msg(cardinal, chat_id, msg, buyer_username=buyer_user)
+                            _log_event("inactivity_reminder_sent", order_id=oid, step=step)
+                    else:
+                        rem_time = sess.get("reminded_password_time", login_at + 120)
+                        if (now - rem_time) >= 180:
+                            _handle_user_inactivity_timeout(cardinal, sess, step)
+                elif step == "waiting_credentials":
+                    cred_at = sess.get("cred_time", now)
+                    if not sess.get("reminded_credentials"):
+                        if (now - cred_at) >= 180:
+                            sess["reminded_credentials"] = True
+                            sess["reminded_credentials_time"] = now
+                            _register_buyer_session(sess)
+                            msg = (
+                                f"⚠️ Напоминание по заказу #{oid}!\n\n"
+                                f"Мы всё ещё ожидаем корректные данные для входа в Steam в формате «логин:пароль»."
+                            )
+                            _send_buyer_fp_msg(cardinal, chat_id, msg, buyer_username=buyer_user)
+                            _log_event("inactivity_reminder_sent", order_id=oid, step=step)
+                    else:
+                        rem_time = sess.get("reminded_credentials_time", cred_at + 180)
+                        if (now - rem_time) >= 180:
+                            _handle_user_inactivity_timeout(cardinal, sess, step)
+        except Exception as e:
+            logger.debug(f"[{NAME}] Ошибка цикла проверки неактивности: {e}")
+def _check_duplicate_plugin_files():
+    try:
+        plugins_dir = os.path.join(BASE_DIR, "plugins")
+        if not os.path.isdir(plugins_dir):
+            return
+        current_name = os.path.basename(__file__) if "__file__" in globals() else "SRC-Plugin.py"
+        duplicates = []
+        for fname in os.listdir(plugins_dir):
+            if not fname.endswith(".py"):
+                continue
+            if fname == current_name:
+                continue
+            f_lower = fname.lower()
+            if any(t in f_lower for t in ("src-plugin", "steam region changer", "src_plugin", "steam-region-changer")):
+                duplicates.append(fname)
+        if duplicates:
+            logger.warning(
+                f"[{NAME}] ⚠️ ВНИМАНИЕ: в папке plugins/ обнаружены дубликаты плагина: {', '.join(duplicates)}! "
+                f"Наличие нескольких копий приводит к конфликту UUID в Cardinal. "
+                f"Пожалуйста, удалите лишние копии из папки plugins/!"
+            )
+    except Exception:
+        pass
+def init_cardinal(cardinal, *args):
+    global cardinal_instance, bot_instance, admin_chat_id
+    cardinal_instance = cardinal
+    _check_duplicate_plugin_files()
+    _init_storage()
+    try:
+        _stop_inactivity_watcher.clear()
+        threading.Thread(target=_inactivity_watcher_loop, args=(cardinal,), daemon=True, name="SRC_InactivityWatcher").start()
+    except Exception as e:
+        logger.warning(f"[{NAME}] Ошибка запуска фонового таймера напоминаний: {e}")
+    bot_obj = getattr(getattr(cardinal, 'telegram', None), 'bot', None)
+    globals()['bot_instance'] = bot_obj
+    try:
+        auth = getattr(getattr(cardinal, 'telegram', None), 'authorized_users', None)
+        if isinstance(auth, dict) and auth:
+            admin_chat_id = int(list(auth.keys())[0])
+    except Exception:
+        admin_chat_id = None
+    try:
+        cardinal.add_telegram_commands(UUID, [('src', 'Steam Region Changer: меню смены региона Steam', True)])
+    except Exception as e:
+        logger.warning(f"[{NAME}] Ошибка регистрации команд: {e}")
+    if bot_obj:
+        def _open_plugin_home(call):
+            try:
+                bot_obj.answer_callback_query(call.id)
+            except Exception:
+                pass
+            cid = getattr(getattr(getattr(call, 'message', None), 'chat', None), 'id', None)
+            mid = getattr(getattr(call, 'message', None), 'message_id', None)
+            if cid:
+                _open_home(cid, mid)
+        def _plugin_entry(data):
+            data = str(data or '')
+            if data in (CBT_SETTINGS, f'{UUID}:0'):
+                return True
+            edit = getattr(_CBT, 'EDIT_PLUGIN', None)
+            settings = getattr(_CBT, 'PLUGIN_SETTINGS', None)
+            return bool((edit is not None and data.startswith(f'{edit}:{UUID}')) or
+                        (settings is not None and data.startswith(f'{settings}:{UUID}')))
+        try:
+            cardinal.telegram.cbq_handler(_open_plugin_home, func=lambda call: _plugin_entry(getattr(call, 'data', None)))
+        except Exception as e:
+            logger.warning(f"[{NAME}] Не удалось привязать кнопку настроек: {e}")
+        try:
+            bot_obj.register_callback_query_handler(
+                _cb_router,
+                func=lambda call: isinstance(getattr(call, 'data', None), str) and call.data.startswith('src_')
+            )
+        except Exception as e:
+            logger.warning(f"[{NAME}] Не удалось привязать callback-обработчик: {e}")
+        def _cmd_src(message):
+            cid = getattr(getattr(message, 'chat', None), 'id', None)
+            if cid and _is_authorized(getattr(getattr(message, 'from_user', None), 'id', None)):
+                _open_home(cid)
+        try:
+            bot_obj.register_message_handler(_cmd_src, commands=['src', 'src_menu'])
+        except Exception as e:
+            logger.warning(f"[{NAME}] Не удалось привязать команду /src: {e}")
+        def _msg_predicate(message):
+            cid = getattr(getattr(message, 'chat', None), 'id', None)
+            if not cid:
+                return False
+            return cid in _waiting
+        try:
+            bot_obj.register_message_handler(_handle_waiting_message, func=_msg_predicate, content_types=['text', 'document'])
+            if hasattr(bot_obj, 'message_handlers') and isinstance(bot_obj.message_handlers, list) and bot_obj.message_handlers:
+                h = bot_obj.message_handlers.pop()
+                bot_obj.message_handlers.insert(0, h)
+        except Exception as e:
+            logger.warning(f"[{NAME}] Не удалось привязать обработчик ввода: {e}")
+    logger.info(f"[{NAME}] Плагин инициализирован (v{VERSION})")
+def order_status_changed_handler(cardinal, event, *args):
+    try:
+        order = getattr(event, 'order', None)
+        order_id = (
+            getattr(order, 'id', None)
+            or getattr(order, 'order_id', None)
+            or getattr(event, 'order_id', None)
+        )
+        if not order_id:
+            return
+        oid = str(order_id).strip().lstrip('#')
+        status = (
+            getattr(order, 'status', None)
+            or getattr(event, 'status', None)
+            or getattr(event, 'new_status', None)
+        )
+        status_name = str(getattr(status, 'name', status) or '').upper()
+        if status_name in ('CLOSED', 'REFUNDED', 'PARTIALLY_REFUNDED', '1', '2', '3'):
+            chat_id = getattr(order, 'chat_id', None) or getattr(event, 'chat_id', None)
+            logger.info(f"[{NAME}] Заказ #{oid} сменил статус на {status_name} — завершаем сессию")
+            _terminate_buyer_session(oid, reason=f"OrderStatusChanged:{status_name}", chat_id=chat_id)
+    except Exception as e:
+        logger.exception(f"[{NAME}] Ошибка в order_status_changed_handler: {e}")
+
+def on_delete(cardinal, *args, **kwargs):
+    _stop_inactivity_watcher.set()
+    try:
+        with _sessions_lock:
+            for sess in list(_active_sessions):
+                sess["canceled"] = True
+                ev = sess.get("cancel_qr_event")
+                if isinstance(ev, threading.Event):
+                    ev.set()
+                guard_ev = sess.get("guard_event")
+                if isinstance(guard_ev, threading.Event):
+                    guard_ev.set()
+    except Exception:
+        pass
+    for executor in (_EVENT_EXECUTOR, _ORDER_EXECUTOR):
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    logger.info(f"[{NAME}] Плагин удален.")
+BIND_TO_PRE_INIT = [init_cardinal]
+BIND_TO_NEW_ORDER = [handle_new_order]
+BIND_TO_NEW_MESSAGE = [handle_new_message]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [handle_new_message]
+BIND_TO_ORDER_STATUS_CHANGED = [order_status_changed_handler]
+BIND_TO_DELETE = on_delete
